@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# 端到端演示：服务 + 本地虚拟设备，覆盖部分拒绝、迟到上报、离线连改、重启保留。
-# 用法: ./demo.sh
+# 端到端演示：预演、相关配置整体生效、部分失败、补偿、离线连改、重启续作。
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -17,53 +16,53 @@ go build -o "$DEMO_DIR/virtualdevice" ./cmd/virtualdevice
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
-dev() { "$DEMO_DIR/virtualdevice" -server "$BASE" -id dev-1 -state "$DEMO_DIR/dev-1.json" "$@"; }
-api() { echo; echo "### $1"; shift; "$@"; echo; }
+dev() { "$DEMO_DIR/virtualdevice" -server "$BASE" -id "$1" -state "$DEMO_DIR/$1.json" "${@:2}"; }
 sleep 0.5
 
-echo '== 1) 下发 rev1，设备拉取后只显示“已下发”，确认后才“已生效” =='
-curl -s -X PUT "$BASE/devices/dev-1/desired" -H 'Content-Type: application/json' -d '{"temp":"22","mode":"eco"}'; echo
-dev poll
-curl -s "$BASE/devices/dev-1/twin"; echo
-dev apply
-curl -s "$BASE/devices/dev-1/twin"; echo
+echo '== 1) 为两台设备建立已确认基线 =='
+curl -s -X PUT "$BASE/devices/dev-a/desired" -H 'Content-Type: application/json' -d '{"temp":"20","mode":"eco"}'; echo
+curl -s -X PUT "$BASE/devices/dev-b/desired" -H 'Content-Type: application/json' -d '{"temp":"20","mode":"eco"}'; echo
+dev dev-a poll; dev dev-a apply
+dev dev-b poll; dev dev-b apply
 
-echo '== 2) rev2：设备拒绝 fan 配置，状态为部分生效，冲突可查询 =='
-curl -s -X PUT "$BASE/devices/dev-1/desired" -H 'Content-Type: application/json' -d '{"temp":"22","mode":"eco","fan":"high"}'; echo
-dev poll
-dev apply -reject fan
-curl -s "$BASE/devices/dev-1/conflicts"; echo
+echo '== 2) 新目标发布前只预演差异，不产生版本 =='
+curl -s -X POST "$BASE/changes/preview" -H 'Content-Type: application/json' \
+  -d '{"targets":{"dev-a":{"temp":"24","mode":"turbo"},"dev-b":{"temp":"24","mode":"turbo"}}}'; echo
 
-echo '== 3) rev3 改为设备支持的配置，全部生效，旧拒绝冲突关闭 =='
-curl -s -X PUT "$BASE/devices/dev-1/desired" -H 'Content-Type: application/json' -d '{"temp":"23","mode":"eco"}'; echo
-dev poll
-dev apply
+echo '== 3) 发布相关配置组：一台接受、一台拒绝，组仍是 PARTIAL =='
+GROUP=$(curl -s -X POST "$BASE/changes" -H 'Content-Type: application/json' \
+  -d '{"targets":{"dev-a":{"temp":"24","mode":"turbo"},"dev-b":{"temp":"24","mode":"turbo"}}}')
+echo "$GROUP"
+GROUP_ID=$(printf '%s' "$GROUP" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+dev dev-a poll; dev dev-a apply
+dev dev-b poll; dev dev-b apply -reject mode
+curl -s "$BASE/changes/$GROUP_ID"; echo
 
-echo '== 4) rev4 后模拟迟到的 rev3 上报：不能盖掉最新目标 =='
-curl -s -X PUT "$BASE/devices/dev-1/desired" -H 'Content-Type:application/json' -d '{"temp":"28"}'; echo
-dev poll
-dev apply
-dev late-report
-curl -s "$BASE/devices/dev-1/twin"; echo
+echo '== 4) 失败后发布补偿目标；补偿只表示已下发，必须重新设备确认 =='
+COMP=$(curl -s -X POST "$BASE/changes/$GROUP_ID/compensate" -H 'Content-Type: application/json' -d '{}')
+echo "$COMP"
+COMP_ID=$(printf '%s' "$COMP" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+dev dev-a poll; dev dev-b poll
+curl -s "$BASE/changes/$COMP_ID"; echo
+dev dev-a resume; dev dev-b resume
+curl -s "$BASE/changes/$COMP_ID"; echo
 
-echo '== 5) 离线期间连续修改 rev6、rev7，恢复后只执行最新版本 =='
-dev offline
-curl -s -X PUT "$BASE/devices/dev-1/desired" -H 'Content-Type: application/json' -d '{"temp":"30"}'; echo
-curl -s -X PUT "$BASE/devices/dev-1/desired" -H 'Content-Type: application/json' -d '{"temp":"32"}'; echo
-dev poll
-dev apply
-curl -s "$BASE/devices/dev-1/conflicts?all=true"; echo
+echo '== 5) 离线期间多次修改；恢复后只拉最新，旧变更保留为 SUPERSEDED 历史 =='
+dev dev-a offline
+curl -s -X PUT "$BASE/devices/dev-a/desired" -H 'Content-Type: application/json' -d '{"temp":"30"}'; echo
+curl -s -X PUT "$BASE/devices/dev-a/desired" -H 'Content-Type: application/json' -d '{"temp":"32"}'; echo
+dev dev-a online; dev dev-a poll; dev dev-a resume
+dev dev-a late-report
+curl -s "$BASE/changes"; echo
 
-echo '== 6) 重启服务：未确认变更在重启后保留 =='
-curl -s -X PUT "$BASE/devices/dev-2/desired" -H 'Content-Type: application/json' -d '{"temp":"19"}'; echo
-dev2() { "$DEMO_DIR/virtualdevice" -server "$BASE" -id dev-2 -state "$DEMO_DIR/dev-2.json" "$@"; }
-dev2 poll
+echo '== 6) 服务重启后，设备从本地缓存继续未完成确认 =='
+curl -s -X PUT "$BASE/devices/dev-c/desired" -H 'Content-Type: application/json' -d '{"temp":"18"}'; echo
+dev dev-c poll
 kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true
 "$DEMO_DIR/twinserver" -addr "$ADDR" -db "$DEMO_DIR/state.json" &
 SERVER_PID=$!
 sleep 0.5
-curl -s "$BASE/devices/dev-2/twin"; echo
-dev2 apply
-curl -s "$BASE/devices/dev-2/twin"; echo
+dev dev-c resume
+curl -s "$BASE/devices/dev-c/twin"; echo
 
 echo; echo '演示完成'

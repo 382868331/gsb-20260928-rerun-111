@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -23,6 +24,11 @@ func New(store *twin.Store) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /devices", s.listDevices)
+	mux.HandleFunc("POST /changes/preview", s.previewChange)
+	mux.HandleFunc("POST /changes", s.publishChange)
+	mux.HandleFunc("GET /changes", s.listChanges)
+	mux.HandleFunc("GET /changes/{id}", s.getChange)
+	mux.HandleFunc("POST /changes/{id}/compensate", s.compensateChange)
 	mux.HandleFunc("PUT /devices/{id}/desired", s.setDesired)
 	mux.HandleFunc("POST /devices/{id}/pull", s.pull)
 	mux.HandleFunc("POST /devices/{id}/report", s.report)
@@ -63,9 +69,77 @@ func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"device_id":   id,
 		"desired_rev": rev,
+		"change_id":   s.mustView(id).DesiredChangeID,
 		"status":      string(twin.StatusPending),
 		"status_text": statusText(twin.StatusPending),
 	})
+}
+
+type changeRequest struct {
+	Targets map[string]twin.Config `json:"targets"`
+}
+
+func decodeTargets(r *http.Request) (map[string]twin.Config, error) {
+	var req changeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return nil, err
+	}
+	return req.Targets, nil
+}
+
+func (s *Server) previewChange(w http.ResponseWriter, r *http.Request) {
+	targets, err := decodeTargets(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "请求必须是 {\"targets\":{\"设备ID\":{...}}} JSON: "+err.Error())
+		return
+	}
+	p, err := s.store.PreviewChange(targets, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) publishChange(w http.ResponseWriter, r *http.Request) {
+	targets, err := decodeTargets(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "请求必须是 {\"targets\":{\"设备ID\":{...}}} JSON: "+err.Error())
+		return
+	}
+	ch, err := s.store.PublishChange(targets, twin.ChangeKindTarget, "", s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, ch)
+}
+
+func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
+	ch, ok := s.store.Change(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "变更不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, ch)
+}
+
+func (s *Server) listChanges(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"changes": s.store.ListChanges()})
+}
+
+func (s *Server) compensateChange(w http.ResponseWriter, r *http.Request) {
+	var req changeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "补偿请求必须是 JSON 对象: "+err.Error())
+		return
+	}
+	ch, err := s.store.PublishCompensation(r.PathValue("id"), req.Targets, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, ch)
 }
 
 func (s *Server) pull(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +154,7 @@ func (s *Server) pull(w http.ResponseWriter, r *http.Request) {
 		"changed":        changed,
 		"desired_rev":    d.DesiredRev,
 		"desired_config": d.DesiredConfig,
+		"change_id":      d.DesiredChangeID,
 	})
 }
 
@@ -149,7 +224,11 @@ func statusText(st twin.Status) string {
 	case twin.StatusDelivered:
 		return "已下发，待设备确认生效"
 	case twin.StatusPartial:
-		return "部分生效，设备拒绝了部分配置"
+		return "部分生效，仍有配置项未确认"
+	case twin.StatusFailed:
+		return "未生效，设备确认失败"
+	case twin.StatusSuperseded:
+		return "已被新目标替代，历史保留"
 	default:
 		return "待下发"
 	}

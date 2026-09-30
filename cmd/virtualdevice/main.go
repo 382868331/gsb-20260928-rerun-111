@@ -14,12 +14,13 @@ import (
 )
 
 type localState struct {
-	ID            string            `json:"id"`
-	Online        bool              `json:"online"`
-	CachedRev     int64             `json:"cached_rev"`
-	CachedConfig  map[string]string `json:"cached_config"`
-	RunningConfig map[string]string `json:"running_config"`
-	LastSeen      time.Time         `json:"last_seen"`
+	ID             string            `json:"id"`
+	Online         bool              `json:"online"`
+	CachedRev      int64             `json:"cached_rev"`
+	CachedConfig   map[string]string `json:"cached_config"`
+	CachedChangeID string            `json:"cached_change_id,omitempty"`
+	RunningConfig  map[string]string `json:"running_config"`
+	LastSeen       time.Time         `json:"last_seen"`
 }
 
 func main() {
@@ -33,7 +34,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: virtualdevice -id dev-1 <poll|apply|late-report|offline|online|state> [-reject k1,k2]")
+		fmt.Fprintln(os.Stderr, "用法: virtualdevice -id dev-1 <poll|apply|late-report|offline|online|resume|restart|state> [-reject k1,k2]")
 		os.Exit(2)
 	}
 	d := &device{server: strings.TrimRight(*serverURL, "/"), id: *id, statePath: *statePath}
@@ -69,6 +70,9 @@ func main() {
 		err = d.post("/offline", nil, nil)
 	case "online":
 		d.st.Online = true
+	case "resume", "restart":
+		err = d.resume(rejectFlags(args[1:]))
+		args = nil
 	case "state":
 		d.printState()
 	default:
@@ -82,6 +86,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "保存本地状态失败: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func rejectFlags(args []string) map[string]bool {
+	reject := map[string]bool{}
+	fs := flag.NewFlagSet("resume", flag.ExitOnError)
+	rejectFlag := fs.String("reject", "", "逗号分隔的要拒绝的配置键")
+	_ = fs.Parse(args)
+	for _, k := range strings.Split(*rejectFlag, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			reject[k] = true
+		}
+	}
+	return reject
 }
 
 type device struct {
@@ -153,6 +170,7 @@ func (d *device) poll() error {
 		Changed       bool              `json:"changed"`
 		DesiredRev    int64             `json:"desired_rev"`
 		DesiredConfig map[string]string `json:"desired_config"`
+		ChangeID      string            `json:"change_id"`
 	}
 	if err := d.post("/pull", nil, &resp); err != nil {
 		return err
@@ -160,11 +178,24 @@ func (d *device) poll() error {
 	if resp.Changed {
 		d.st.CachedRev = resp.DesiredRev
 		d.st.CachedConfig = resp.DesiredConfig
-		fmt.Printf("[设备 %s] 拉取到新期望 rev=%d %v（仅已下发，尚未生效）\n", d.id, resp.DesiredRev, resp.DesiredConfig)
+		d.st.CachedChangeID = resp.ChangeID
+		fmt.Printf("[设备 %s] 拉取到新期望 change=%s rev=%d %v（仅已下发，尚未生效）\n", d.id, resp.ChangeID, resp.DesiredRev, resp.DesiredConfig)
 	} else {
 		fmt.Printf("[设备 %s] 无新配置（期望 rev=%d）\n", d.id, resp.DesiredRev)
 	}
 	return nil
+}
+
+func (d *device) resume(reject map[string]bool) error {
+	if err := d.poll(); err != nil {
+		return err
+	}
+	if d.st.CachedRev == 0 {
+		fmt.Printf("[设备 %s] 重启后没有待继续的配置操作\n", d.id)
+		return nil
+	}
+	fmt.Printf("[设备 %s] 重启恢复本地缓存 change=%s rev=%d，继续确认\n", d.id, d.st.CachedChangeID, d.st.CachedRev)
+	return d.apply(reject, d.st.CachedRev)
 }
 
 func (d *device) apply(reject map[string]bool, reportRev int64) error {

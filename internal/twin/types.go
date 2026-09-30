@@ -17,22 +17,63 @@ const (
 	StatusPartial Status = "PARTIAL"
 	// StatusEffective 设备已确认期望配置全部生效。
 	StatusEffective Status = "EFFECTIVE"
+	// StatusFailed 设备未能应用目标，需要由新的目标或补偿目标接管。
+	StatusFailed Status = "FAILED"
+	// StatusSuperseded 目标尚未整体完成就被新目标替代，只保留历史。
+	StatusSuperseded Status = "SUPERSEDED"
 )
+
+type ChangeKind string
+
+const (
+	ChangeKindTarget       ChangeKind = "TARGET"
+	ChangeKindCompensation ChangeKind = "COMPENSATION"
+)
+
+// Change 是一次面向一组设备整体发布的配置目标。
+// 只有 Targets 中每台设备都精确确认自己的目标，整个变更才生效。
+type Change struct {
+	ID              string                        `json:"id"`
+	Kind            ChangeKind                    `json:"kind"`
+	Targets         map[string]Config             `json:"targets"`
+	BaselineTargets map[string]Config             `json:"baseline_targets,omitempty"`
+	DeliveredRevs   map[string]int64              `json:"delivered_revs"`
+	DeviceResults   map[string]ChangeDeviceResult `json:"device_results"`
+	Status          Status                        `json:"status"`
+	Supersedes      []string                      `json:"supersedes,omitempty"`
+	CompensatesFor  string                        `json:"compensates_for,omitempty"`
+	CreatedAt       time.Time                     `json:"created_at"`
+	EffectiveAt     *time.Time                    `json:"effective_at,omitempty"`
+	SupersededAt    *time.Time                    `json:"superseded_at,omitempty"`
+}
+
+type ChangeDeviceResult struct {
+	DesiredRev    int64     `json:"desired_rev"`
+	DeliveredRev  int64     `json:"delivered_rev"`
+	ReportedRev   int64     `json:"reported_rev"`
+	AppliedConfig Config    `json:"applied_config"`
+	Rejected      Config    `json:"rejected,omitempty"`
+	Status        Status    `json:"status"`
+	Stale         bool      `json:"stale,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
 
 // Device 保存一台设备的孪生三态：期望、已上报、已确认。
 type Device struct {
 	ID     string `json:"id"`
 	Online bool   `json:"online"`
 	// DesiredConfig 是服务端最新目标（整份快照），DesiredRev 为单调递增版本号。
-	DesiredConfig Config `json:"desired_config"`
-	DesiredRev    int64  `json:"desired_rev"`
+	DesiredConfig   Config `json:"desired_config"`
+	DesiredRev      int64  `json:"desired_rev"`
+	DesiredChangeID string `json:"desired_change_id,omitempty"`
 	// DeliveredRev 是最近一次设备拉取过的期望版本；仅表示已下发。
 	DeliveredRev int64     `json:"delivered_rev"`
 	DeliveredAt  time.Time `json:"delivered_at"`
 	// ReportedConfig 是设备最近上报的运行配置，ReportedRev 为上报所针对的期望版本。
-	ReportedConfig Config    `json:"reported_config"`
-	ReportedRev    int64     `json:"reported_rev"`
-	ReportedAt     time.Time `json:"reported_at"`
+	ReportedConfig   Config    `json:"reported_config"`
+	ReportedRev      int64     `json:"reported_rev"`
+	ReportedRejected Config    `json:"reported_rejected,omitempty"`
+	ReportedAt       time.Time `json:"reported_at"`
 	// ConfirmedConfig 是服务端确认与期望一致的实际状态，旧确认不会被迟到上报回退。
 	ConfirmedConfig Config    `json:"confirmed_config"`
 	ConfirmedRev    int64     `json:"confirmed_rev"`
@@ -47,14 +88,20 @@ func (d *Device) Status(now time.Time) Status {
 	if d.ConfirmedRev >= d.DesiredRev && configEqual(d.ConfirmedConfig, d.DesiredConfig) {
 		return StatusEffective
 	}
-	if d.ConfirmedRev >= d.DesiredRev {
-		// 版本号到了但配置不一致：设备拒绝了部分配置。
-		return StatusPartial
+	if d.ReportedRev == d.DesiredRev && !d.ReportedAt.IsZero() {
+		if len(d.ReportedRejected) > 0 {
+			return StatusPartial
+		}
+		return StatusFailed
 	}
 	if d.DeliveredRev >= d.DesiredRev && !d.DeliveredAt.IsZero() {
 		return StatusDelivered
 	}
 	return StatusPending
+}
+
+func (d *Device) isDesiredConfirmedLocked() bool {
+	return d.DesiredRev > 0 && d.ConfirmedRev >= d.DesiredRev && configEqual(d.ConfirmedConfig, d.DesiredConfig)
 }
 
 type ConflictReason string
@@ -66,6 +113,8 @@ const (
 	ReasonStale ConflictReason = "STALE_REPORT"
 	// ReasonSuperseded 离线期间期望被连续修改，一个尚未完成的下发版本被跳过。
 	ReasonSuperseded ConflictReason = "SUPERSEDED"
+	// ReasonMismatch 设备针对当前版本上报的实际配置与期望既不完全一致，也没有逐项列明拒绝。
+	ReasonMismatch ConflictReason = "APPLIED_MISMATCH"
 )
 
 // Conflict 记录期望与设备实际之间出现过的分歧。
@@ -87,19 +136,44 @@ type ReportRequest struct {
 	Rejected Config `json:"rejected"`
 }
 
+type DeviceDiff struct {
+	DeviceID      string   `json:"device_id"`
+	CurrentRev    int64    `json:"current_rev"`
+	CurrentConfig Config   `json:"current_config"`
+	TargetConfig  Config   `json:"target_config"`
+	Added         Config   `json:"added"`
+	Updated       Config   `json:"updated"`
+	Removed       []string `json:"removed"`
+	ConfirmedRev  int64    `json:"confirmed_rev"`
+	ReportedRev   int64    `json:"reported_rev"`
+	CurrentStatus Status   `json:"current_status"`
+}
+
+type Preview struct {
+	Targets map[string]Config `json:"targets"`
+	Diffs   []DeviceDiff      `json:"diffs"`
+}
+
+type ChangeView struct {
+	*Change
+	StatusText string `json:"status_text"`
+}
+
 // TwinView 是对外展示的完整孪生视图，三态严格区分。
 type TwinView struct {
-	DeviceID        string `json:"device_id"`
-	Online          bool   `json:"online"`
-	Status          Status `json:"status"`
-	StatusText      string `json:"status_text"`
-	DesiredRev      int64  `json:"desired_rev"`
-	DesiredConfig   Config `json:"desired_config"`
-	DeliveredRev    int64  `json:"delivered_rev"`
-	ReportedRev     int64  `json:"reported_rev"`
-	ReportedConfig  Config `json:"reported_config"`
-	ConfirmedRev    int64  `json:"confirmed_rev"`
-	ConfirmedConfig Config `json:"confirmed_config"`
+	DeviceID         string `json:"device_id"`
+	Online           bool   `json:"online"`
+	DesiredChangeID  string `json:"desired_change_id,omitempty"`
+	Status           Status `json:"status"`
+	StatusText       string `json:"status_text"`
+	DesiredRev       int64  `json:"desired_rev"`
+	DesiredConfig    Config `json:"desired_config"`
+	DeliveredRev     int64  `json:"delivered_rev"`
+	ReportedRev      int64  `json:"reported_rev"`
+	ReportedConfig   Config `json:"reported_config"`
+	ReportedRejected Config `json:"reported_rejected,omitempty"`
+	ConfirmedRev     int64  `json:"confirmed_rev"`
+	ConfirmedConfig  Config `json:"confirmed_config"`
 }
 
 func configEqual(a, b Config) bool {

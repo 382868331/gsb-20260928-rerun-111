@@ -28,6 +28,15 @@ func newHarness(t *testing.T) (testClient, *twin.Store, string) {
 	return testClient{t: t, h: server.New(store).Routes()}, store, dbPath
 }
 
+func newHarnessFromPath(t *testing.T, dbPath string) testClient {
+	t.Helper()
+	store, err := twin.NewStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testClient{t: t, h: server.New(store).Routes()}
+}
+
 func (c testClient) do(method, path string, body any, out any) {
 	c.t.Helper()
 	var buf bytes.Buffer
@@ -92,6 +101,34 @@ func (c testClient) conflicts(id string, all bool) []twin.Conflict {
 	}
 	c.do(http.MethodGet, "/devices/"+id+"/conflicts"+q, nil, &resp)
 	return resp.Conflicts
+}
+
+func (c testClient) preview(targets map[string]twin.Config) twin.Preview {
+	var p twin.Preview
+	c.do(http.MethodPost, "/changes/preview", map[string]any{"targets": targets}, &p)
+	return p
+}
+
+func (c testClient) publish(targets map[string]twin.Config) twin.Change {
+	var ch twin.Change
+	c.do(http.MethodPost, "/changes", map[string]any{"targets": targets}, &ch)
+	return ch
+}
+
+func (c testClient) change(id string) twin.Change {
+	var ch twin.Change
+	c.do(http.MethodGet, "/changes/"+id, nil, &ch)
+	return ch
+}
+
+func (c testClient) compensate(id string, targets map[string]twin.Config) twin.Change {
+	var ch twin.Change
+	body := map[string]any{}
+	if targets != nil {
+		body["targets"] = targets
+	}
+	c.do(http.MethodPost, "/changes/"+id+"/compensate", body, &ch)
+	return ch
 }
 
 // 完整流程：下发 -> 已下发但未生效 -> 确认生效，三态严格区分。
@@ -237,6 +274,170 @@ func TestRestartPersistsPendingChange(t *testing.T) {
 	c2.report("dev-2", twin.ReportRequest{Rev: 1, Applied: twin.Config{"temp": "25"}})
 	if st := c2.twin("dev-2").Status; st != twin.StatusEffective {
 		t.Fatalf("重启后设备仍可完成未竟变更，得到 %s", st)
+	}
+}
+
+// 相关配置是一个整体：一台设备成功确认不能让变更组生效，部分设备必须保留实际状态和冲突。
+func TestGroupEffectiveRequiresEveryDevice(t *testing.T) {
+	c, _, _ := newHarness(t)
+	base := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "20"},
+		"dev-2": {"temp": "20"},
+	})
+	c.pull("dev-1")
+	c.pull("dev-2")
+	c.report("dev-1", twin.ReportRequest{Rev: base.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	c.report("dev-2", twin.ReportRequest{Rev: base.DeviceResults["dev-2"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	if c.change(base.ID).Status != twin.StatusEffective {
+		t.Fatalf("两台设备均确认后变更组才应 EFFECTIVE")
+	}
+
+	target := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "22"},
+		"dev-2": {"temp": "22"},
+	})
+	rev1 := target.DeviceResults["dev-1"].DesiredRev
+	rev2 := target.DeviceResults["dev-2"].DesiredRev
+	c.pull("dev-1")
+	c.pull("dev-2")
+	c.report("dev-1", twin.ReportRequest{Rev: rev1, Applied: twin.Config{"temp": "22"}})
+	c.report("dev-2", twin.ReportRequest{Rev: rev2, Applied: twin.Config{"temp": "20"}, Rejected: twin.Config{"temp": "22"}})
+
+	ch := c.change(target.ID)
+	if ch.Status != twin.StatusPartial {
+		t.Fatalf("一台成功、一台拒绝时变更组应为 PARTIAL，得到 %s", ch.Status)
+	}
+	if ch.DeviceResults["dev-1"].Status != twin.StatusEffective {
+		t.Fatalf("应保留 dev-1 自己的成功结果，得到 %+v", ch.DeviceResults["dev-1"])
+	}
+	if ch.DeviceResults["dev-2"].Status != twin.StatusPartial {
+		t.Fatalf("应保留 dev-2 的部分实际状态，得到 %+v", ch.DeviceResults["dev-2"])
+	}
+	v2 := c.twin("dev-2")
+	if v2.Status != twin.StatusPartial || v2.ConfirmedRev != 1 || v2.ConfirmedConfig["temp"] != "20" {
+		t.Fatalf("dev-2 不能借用 dev-1 的成功，且确认版本不能推进，得到 %+v", v2)
+	}
+	if open := c.conflicts("dev-2", false); len(open) != 1 || open[0].Reason != twin.ReasonRejected {
+		t.Fatalf("dev-2 应保留未解决拒绝冲突，得到 %+v", open)
+	}
+}
+
+// 设备针对当前版本上报非期望实际值且未列明拒绝时，状态是失败而非部分生效，并保留冲突。
+func TestCurrentVersionMismatchKeepsActualState(t *testing.T) {
+	c, _, _ := newHarness(t)
+	ch := c.publish(map[string]twin.Config{"dev-1": {"temp": "22", "mode": "eco"}})
+	c.pull("dev-1")
+	c.report("dev-1", twin.ReportRequest{Rev: ch.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "21"}})
+	v := c.twin("dev-1")
+	if v.Status != twin.StatusFailed || v.ConfirmedRev != 0 || v.ReportedConfig["temp"] != "21" {
+		t.Fatalf("非期望实际值应保留为观察状态 FAILED 且不能确认，得到 %+v", v)
+	}
+	open := c.conflicts("dev-1", false)
+	if len(open) != 1 || open[0].Reason != twin.ReasonMismatch {
+		t.Fatalf("应记录 APPLIED_MISMATCH，得到 %+v", open)
+	}
+}
+
+// 预演只输出差异，不生成期望版本或变更。
+func TestPreviewDoesNotPublish(t *testing.T) {
+	c, _, _ := newHarness(t)
+	p := c.preview(map[string]twin.Config{"dev-9": {"mode": "eco", "temp": "21"}})
+	if len(p.Diffs) != 1 || p.Diffs[0].CurrentRev != 0 || p.Diffs[0].Added["mode"] != "eco" {
+		t.Fatalf("预演应给出新增项差异，得到 %+v", p)
+	}
+	var list struct {
+		Devices []twin.TwinView `json:"devices"`
+	}
+	c.do(http.MethodGet, "/devices", nil, &list)
+	if len(list.Devices) != 0 {
+		t.Fatalf("预演不能创建设备或发布目标，得到 %+v", list.Devices)
+	}
+}
+
+// 失败后的补偿是新目标；即使回到旧确认值，也必须重新下发并由每台设备确认。
+func TestCompensationRequiresDeviceConfirmation(t *testing.T) {
+	c, _, _ := newHarness(t)
+	base := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "20"},
+		"dev-2": {"temp": "20"},
+	})
+	c.pull("dev-1")
+	c.pull("dev-2")
+	c.report("dev-1", twin.ReportRequest{Rev: base.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	c.report("dev-2", twin.ReportRequest{Rev: base.DeviceResults["dev-2"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	failed := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "23"},
+		"dev-2": {"temp": "23"},
+	})
+	c.pull("dev-1")
+	c.pull("dev-2")
+	c.report("dev-1", twin.ReportRequest{Rev: failed.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "23"}})
+	c.report("dev-2", twin.ReportRequest{Rev: failed.DeviceResults["dev-2"].DesiredRev, Applied: twin.Config{"temp": "20"}, Rejected: twin.Config{"temp": "23"}})
+
+	comp := c.compensate(failed.ID, nil)
+	if comp.Kind != twin.ChangeKindCompensation || comp.CompensatesFor != failed.ID || comp.Status != twin.StatusPending {
+		t.Fatalf("补偿应是待设备确认的新目标，得到 %+v", comp)
+	}
+	if comp.Targets["dev-1"]["temp"] != "20" || comp.Targets["dev-2"]["temp"] != "20" {
+		t.Fatalf("未显式指定时补偿目标应回到各自最后确认值，得到 %+v", comp.Targets)
+	}
+	if c.change(comp.ID).Status != twin.StatusPending {
+		t.Fatal("补偿发布不能自动生效")
+	}
+	c.pull("dev-1")
+	c.pull("dev-2")
+	if got := c.change(comp.ID).Status; got != twin.StatusDelivered {
+		t.Fatalf("补偿仅下发后应为 DELIVERED，得到 %s", got)
+	}
+	c.report("dev-1", twin.ReportRequest{Rev: comp.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	c.report("dev-2", twin.ReportRequest{Rev: comp.DeviceResults["dev-2"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	if got := c.change(comp.ID).Status; got != twin.StatusEffective {
+		t.Fatalf("补偿经设备确认后才应 EFFECTIVE，得到 %s", got)
+	}
+	old := c.change(failed.ID)
+	if old.Status != twin.StatusSuperseded || old.DeviceResults["dev-1"].Status != twin.StatusEffective || old.DeviceResults["dev-2"].Status != twin.StatusSuperseded {
+		t.Fatalf("被补偿替代的失败变更应保留逐设备历史，得到 %+v", old)
+	}
+}
+
+// 变更组、下发状态和逐设备目标随服务重启恢复，设备重新上线后继续未完成操作。
+func TestChangeGroupRestartAndResume(t *testing.T) {
+	c, _, dbPath := newHarness(t)
+	ch := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "18"},
+		"dev-2": {"temp": "19"},
+	})
+	c.pull("dev-1")
+
+	c2 := newHarnessFromPath(t, dbPath)
+	restored := c2.change(ch.ID)
+	if restored.Status != twin.StatusDelivered {
+		t.Fatalf("重启后变更组应恢复为 DELIVERED，得到 %s", restored.Status)
+	}
+	c2.pull("dev-2")
+	c2.report("dev-1", twin.ReportRequest{Rev: restored.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "18"}})
+	c2.report("dev-2", twin.ReportRequest{Rev: restored.DeviceResults["dev-2"].DesiredRev, Applied: twin.Config{"temp": "19"}})
+	if got := c2.change(ch.ID).Status; got != twin.StatusEffective {
+		t.Fatalf("重开后设备继续确认应完成变更，得到 %s", got)
+	}
+}
+
+// 旧确认迟到时，只作为观察/历史，不改变当前目标或已被替代变更的成功记录。
+func TestStaleReportPreservesSupersededHistory(t *testing.T) {
+	c, _, _ := newHarness(t)
+	old := c.publish(map[string]twin.Config{"dev-1": {"temp": "20"}})
+	c.pull("dev-1")
+	c.report("dev-1", twin.ReportRequest{Rev: old.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	current := c.publish(map[string]twin.Config{"dev-1": {"temp": "26"}})
+	c.report("dev-1", twin.ReportRequest{Rev: old.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	if got := c.change(old.ID).Status; got != twin.StatusSuperseded {
+		t.Fatalf("旧变更应标记 SUPERSEDED，得到 %s", got)
+	}
+	if got := c.change(old.ID).DeviceResults["dev-1"].Status; got != twin.StatusEffective {
+		t.Fatalf("旧设备成功确认应保留，得到 %s", got)
+	}
+	if v := c.twin("dev-1"); v.DesiredRev != current.DeviceResults["dev-1"].DesiredRev || v.ConfirmedConfig["temp"] != "20" {
+		t.Fatalf("迟到旧确认不能改变当前期望或回退确认配置，得到 %+v", v)
 	}
 }
 
