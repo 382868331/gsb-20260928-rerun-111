@@ -17,7 +17,31 @@ const (
 	StatusPartial Status = "PARTIAL"
 	// StatusEffective 设备已确认期望配置全部生效。
 	StatusEffective Status = "EFFECTIVE"
+	// StatusSuperseded 只用于变更记录：该版本尚未全部生效就被更新的目标替代。
+	StatusSuperseded Status = "SUPERSEDED"
 )
+
+// ChangeKind 区分普通目标与失败后发起的补偿目标。
+type ChangeKind string
+
+const (
+	ChangeNormal       ChangeKind = "NORMAL"
+	ChangeCompensation ChangeKind = "COMPENSATION"
+)
+
+// Change 是一次期望发布在单台设备上留下的不可丢弃记录。
+// 即使版本从未下发或后来被替代，记录仍保留，用于离线连改、重启后的核对与审计。
+type Change struct {
+	Rev         int64      `json:"rev"`
+	TargetID    string     `json:"target_id"`
+	Kind        ChangeKind `json:"kind"`
+	Config      Config     `json:"config"`
+	Status      Status     `json:"status"`
+	Rejected    Config     `json:"rejected,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	DeliveredAt *time.Time `json:"delivered_at,omitempty"`
+	ConfirmedAt *time.Time `json:"confirmed_at,omitempty"`
+}
 
 // Device 保存一台设备的孪生三态：期望、已上报、已确认。
 type Device struct {
@@ -37,6 +61,8 @@ type Device struct {
 	ConfirmedConfig Config    `json:"confirmed_config"`
 	ConfirmedRev    int64     `json:"confirmed_rev"`
 	ConfirmedAt     time.Time `json:"confirmed_at"`
+	// Changes 保留该设备每一次期望发布的记录，包括已被替代、从未下发完成的版本。
+	Changes []*Change `json:"changes"`
 }
 
 // Status 计算当前期望版本所处状态。
@@ -78,6 +104,77 @@ type Conflict struct {
 	Open       bool           `json:"open"`
 	CreatedAt  time.Time      `json:"created_at"`
 	ResolvedAt *time.Time     `json:"resolved_at,omitempty"`
+}
+
+// Target 是一次发布：可能包含一组设备上的相关配置，必须每台设备各自确认后才算整体生效。
+type Target struct {
+	ID          string       `json:"id"`
+	Kind        ChangeKind   `json:"kind"`
+	Compensates string       `json:"compensates,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	Items       []TargetItem `json:"items"`
+}
+
+// TargetItem 记录目标在某台设备上对应哪个期望版本。
+type TargetItem struct {
+	DeviceID string `json:"device_id"`
+	Rev      int64  `json:"rev"`
+}
+
+// TargetItemView 是目标中一台设备的实时生效情况，只取该设备自己的孪生状态。
+type TargetItemView struct {
+	DeviceID        string `json:"device_id"`
+	Rev             int64  `json:"rev"`
+	Status          Status `json:"status"`
+	StatusText      string `json:"status_text"`
+	DesiredRev      int64  `json:"desired_rev"`
+	ReportedRev     int64  `json:"reported_rev"`
+	ConfirmedRev    int64  `json:"confirmed_rev"`
+	ConfirmedConfig Config `json:"confirmed_config"`
+}
+
+// TargetView 展示目标整体生效条件：任何一台设备仅已下发或部分生效，整体都不算生效。
+type TargetView struct {
+	ID          string           `json:"id"`
+	Kind        ChangeKind       `json:"kind"`
+	Compensates string           `json:"compensates,omitempty"`
+	CreatedAt   time.Time        `json:"created_at"`
+	Overall     Status           `json:"overall_status"`
+	OverallText string           `json:"overall_status_text"`
+	Items       []TargetItemView `json:"items"`
+}
+
+// FieldDiff 描述单个配置项的新旧值。
+type FieldDiff struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// ConfigDiff 是新目标发布前的预演差异，不产生任何状态变更。
+type ConfigDiff struct {
+	Add    Config               `json:"add"`
+	Remove Config               `json:"remove"`
+	Change map[string]FieldDiff `json:"change"`
+}
+
+// DiffConfig 对比两份整份配置快照。
+func DiffConfig(base, next Config) ConfigDiff {
+	diff := ConfigDiff{Add: Config{}, Remove: Config{}, Change: map[string]FieldDiff{}}
+	for k, v := range next {
+		old, ok := base[k]
+		switch {
+		case !ok:
+			diff.Add[k] = v
+		case old != v:
+			diff.Change[k] = FieldDiff{From: old, To: v}
+		}
+	}
+	for k, v := range base {
+		if _, ok := next[k]; !ok {
+			diff.Remove[k] = v
+		}
+	}
+	return diff
 }
 
 // ReportRequest 是设备上报的配置结果。

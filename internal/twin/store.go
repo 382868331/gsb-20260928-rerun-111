@@ -15,19 +15,24 @@ type Store struct {
 	path        string
 	devices     map[string]*Device
 	conflicts   map[string]*Conflict
+	targets     map[string]*Target
 	conflictSeq int64
+	targetSeq   int64
 }
 
 type snapshot struct {
 	Devices     []*Device   `json:"devices"`
 	Conflicts   []*Conflict `json:"conflicts"`
+	Targets     []*Target   `json:"targets"`
 	ConflictSeq int64       `json:"conflict_seq"`
+	TargetSeq   int64       `json:"target_seq"`
 }
 
 func NewStore(path string) (*Store, error) {
 	s := &Store{
 		path:      path,
 		devices:   map[string]*Device{},
+		targets:   map[string]*Target{},
 		conflicts: map[string]*Conflict{},
 	}
 	if err := s.load(); err != nil {
@@ -54,7 +59,11 @@ func (s *Store) load() error {
 	for _, c := range snap.Conflicts {
 		s.conflicts[c.ID] = c
 	}
+	for _, t := range snap.Targets {
+		s.targets[t.ID] = t
+	}
 	s.conflictSeq = snap.ConflictSeq
+	s.targetSeq = snap.TargetSeq
 	return nil
 }
 
@@ -69,6 +78,11 @@ func (s *Store) persistLocked() error {
 		snap.Conflicts = append(snap.Conflicts, c)
 	}
 	sort.Slice(snap.Conflicts, func(i, j int) bool { return snap.Conflicts[i].ID < snap.Conflicts[j].ID })
+	for _, t := range s.targets {
+		snap.Targets = append(snap.Targets, t)
+	}
+	sort.Slice(snap.Targets, func(i, j int) bool { return snap.Targets[i].ID < snap.Targets[j].ID })
+	snap.TargetSeq = s.targetSeq
 
 	data, err := json.MarshalIndent(&snap, "", "  ")
 	if err != nil {
@@ -108,21 +122,130 @@ func (s *Store) addConflictLocked(deviceID string, reason ConflictReason, rev in
 	return c
 }
 
-// SetDesired 写入新的期望快照。离线期间的连续修改只推进 DesiredRev；
-// 若设备上一轮下发的版本尚未确认，则记一条 SUPERSEDED 冲突，恢复后不会补执行旧版本。
-func (s *Store) SetDesired(deviceID string, cfg Config, now time.Time) (*Device, int64, error) {
+// Preview 预演一份配置相对设备当前期望的差异，不修改任何状态。
+func (s *Store) Preview(deviceID string, cfg Config) ConfigDiff {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d := s.deviceLocked(deviceID)
-	if d.DesiredRev > 0 && d.DeliveredRev >= d.DesiredRev && d.ConfirmedRev < d.DesiredRev {
-		s.addConflictLocked(deviceID, ReasonSuperseded, d.DesiredRev, d.DesiredConfig, now)
+	return DiffConfig(cloneConfig(d.DesiredConfig), cloneConfig(cfg))
+}
+
+// SetDesired 向单台设备发布新目标（普通变更）。
+func (s *Store) SetDesired(deviceID string, cfg Config, now time.Time) (*Target, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.publishLocked(map[string]Config{deviceID: cfg}, ChangeNormal, "", now)
+}
+
+// PublishTarget 向一组设备发布相关配置目标。配置作为一个整体，
+// 只有每台设备都确认生效，目标整体才算 EFFECTIVE。
+func (s *Store) PublishTarget(spec map[string]Config, now time.Time) (*Target, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(spec) == 0 {
+		return nil, fmt.Errorf("目标至少要包含一台设备")
 	}
-	d.DesiredRev++
-	d.DesiredConfig = cloneConfig(cfg)
+	return s.publishLocked(spec, ChangeNormal, "", now)
+}
+
+// publishLocked 必须在持锁状态下调用。
+func (s *Store) publishLocked(spec map[string]Config, kind ChangeKind, compensates string, now time.Time) (*Target, error) {
+	now = now.UTC()
+	s.targetSeq++
+	t := &Target{
+		ID:          fmt.Sprintf("T%06d", s.targetSeq),
+		Kind:        kind,
+		Compensates: compensates,
+		CreatedAt:   now,
+	}
+	ids := make([]string, 0, len(spec))
+	for id := range spec {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		d := s.deviceLocked(id)
+		// 设备上一轮已下发但未全部确认的版本被新版本替代：记录冲突，同时保留变更记录。
+		if d.DesiredRev > 0 && d.DeliveredRev >= d.DesiredRev && d.ConfirmedRev < d.DesiredRev {
+			s.addConflictLocked(id, ReasonSuperseded, d.DesiredRev, d.DesiredConfig, now)
+		}
+		if ch := s.lastChangeLocked(d); ch != nil && ch.Status != StatusEffective {
+			ch.Status = StatusSuperseded
+		}
+		d.DesiredRev++
+		d.DesiredConfig = cloneConfig(spec[id])
+		ch := &Change{
+			Rev:       d.DesiredRev,
+			TargetID:  t.ID,
+			Kind:      kind,
+			Config:    cloneConfig(spec[id]),
+			Status:    StatusPending,
+			CreatedAt: now,
+		}
+		d.Changes = append(d.Changes, ch)
+		t.Items = append(t.Items, TargetItem{DeviceID: id, Rev: d.DesiredRev})
+	}
+	s.targets[t.ID] = t
 	if err := s.persistLocked(); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return d, d.DesiredRev, nil
+	return t, nil
+}
+
+// Compensate 为一个尚未整体生效的目标发起补偿目标。补偿是新的期望版本，
+// 必须重新经过设备拉取与确认，不能直接标记为生效。
+func (s *Store) Compensate(targetID string, spec map[string]Config, now time.Time) (*Target, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.targets[targetID]
+	if !ok {
+		return nil, fmt.Errorf("目标 %s 不存在", targetID)
+	}
+	if len(spec) == 0 {
+		// 默认补偿内容：回退为各设备最近一次已确认配置。
+		spec = map[string]Config{}
+		for _, item := range old.Items {
+			d := s.deviceLocked(item.DeviceID)
+			spec[item.DeviceID] = cloneConfig(d.ConfirmedConfig)
+		}
+	}
+	for _, item := range old.Items {
+		if _, ok := spec[item.DeviceID]; !ok {
+			return nil, fmt.Errorf("补偿目标必须覆盖原目标的所有设备，缺少 %s", item.DeviceID)
+		}
+	}
+	for id := range spec {
+		if !targetHasDevice(old, id) {
+			return nil, fmt.Errorf("设备 %s 不在原目标中", id)
+		}
+	}
+	return s.publishLocked(spec, ChangeCompensation, targetID, now)
+}
+
+func targetHasDevice(t *Target, id string) bool {
+	for _, item := range t.Items {
+		if item.DeviceID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) lastChangeLocked(d *Device) *Change {
+	if len(d.Changes) == 0 {
+		return nil
+	}
+	return d.Changes[len(d.Changes)-1]
+}
+
+// changeLocked 找到设备某个期望版本的变更记录。
+func (s *Store) changeLocked(d *Device, rev int64) *Change {
+	for _, ch := range d.Changes {
+		if ch.Rev == rev {
+			return ch
+		}
+	}
+	return nil
 }
 
 // Pull 是设备拉取最新目标。只标记为“已下发”，状态不会跳到“已生效”。
@@ -135,6 +258,11 @@ func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 	if changed {
 		d.DeliveredRev = d.DesiredRev
 		d.DeliveredAt = now.UTC()
+		if ch := s.lastChangeLocked(d); ch != nil && ch.Rev == d.DesiredRev && ch.Status == StatusPending {
+			delivered := now.UTC()
+			ch.Status = StatusDelivered
+			ch.DeliveredAt = &delivered
+		}
 	}
 	if err := s.persistLocked(); err != nil {
 		return nil, false, err
@@ -159,6 +287,10 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 	if req.Rev > d.DeliveredRev {
 		d.DeliveredRev = req.Rev
 		d.DeliveredAt = now
+		if ch := s.changeLocked(d, req.Rev); ch != nil && ch.Status == StatusPending {
+			ch.Status = StatusDelivered
+			ch.DeliveredAt = &now
+		}
 	}
 
 	stale := req.Rev < d.DesiredRev
@@ -183,6 +315,17 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 		d.ConfirmedRev = req.Rev
 		d.ConfirmedAt = now
 		d.ConfirmedConfig = cloneConfig(req.Applied)
+	}
+	// 同步该版本变更记录的实际结果；接受部分配置保留为 PARTIAL，绝不当作整体生效。
+	if ch := s.changeLocked(d, req.Rev); ch != nil && ch.Status != StatusSuperseded {
+		ch.Rejected = cloneConfig(req.Rejected)
+		if len(req.Rejected) == 0 && req.Rev == d.DesiredRev && configEqual(req.Applied, d.DesiredConfig) {
+			ch.Status = StatusEffective
+			confirmed := now
+			ch.ConfirmedAt = &confirmed
+		} else if req.Rev == d.DesiredRev {
+			ch.Status = StatusPartial
+		}
 	}
 	// 只有设备完全按期望接受时，之前的拒绝冲突才算解决。
 	if len(req.Rejected) == 0 && req.Rev == d.DesiredRev && configEqual(req.Applied, d.DesiredConfig) {
@@ -273,6 +416,93 @@ func (s *Store) Conflicts(deviceID string, includeResolved bool) []*Conflict {
 	return out
 }
 
+// Changes 返回一台设备的全部期望发布记录，包括已被替代、从未完成的版本。
+func (s *Store) Changes(deviceID string) []*Change {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.devices[deviceID]
+	if !ok {
+		return nil
+	}
+	out := make([]*Change, 0, len(d.Changes))
+	for _, ch := range d.Changes {
+		cp := *ch
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// Target 视图：整体状态只由每台设备自身的当前孪生状态聚合，
+// 任何一台已下发未确认或部分生效，整体都不是 EFFECTIVE。
+func (s *Store) TargetView(id string, now time.Time) (*TargetView, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.targets[id]
+	if !ok {
+		return nil, false
+	}
+	return s.targetViewLocked(t, now), true
+}
+
+func (s *Store) targetViewLocked(t *Target, now time.Time) *TargetView {
+	v := &TargetView{
+		ID:          t.ID,
+		Kind:        t.Kind,
+		Compensates: t.Compensates,
+		CreatedAt:   t.CreatedAt,
+		Items:       []TargetItemView{},
+	}
+	overall := StatusEffective
+	for _, item := range t.Items {
+		d := s.deviceLocked(item.DeviceID)
+		st := StatusPending
+		if ch := s.changeLocked(d, item.Rev); ch != nil {
+			st = ch.Status
+		}
+		switch {
+		case st == StatusSuperseded:
+			if overall == StatusEffective {
+				overall = StatusSuperseded
+			}
+		case st == StatusPartial:
+			overall = StatusPartial
+		case st == StatusDelivered && overall != StatusPartial:
+			overall = StatusDelivered
+		case st == StatusPending && overall != StatusPartial && overall != StatusDelivered:
+			overall = StatusPending
+		}
+		iv := TargetItemView{
+			DeviceID:        item.DeviceID,
+			Rev:             item.Rev,
+			Status:          st,
+			StatusText:      statusText(st),
+			DesiredRev:      d.DesiredRev,
+			ReportedRev:     d.ReportedRev,
+			ConfirmedRev:    d.ConfirmedRev,
+			ConfirmedConfig: cloneConfig(d.ConfirmedConfig),
+		}
+		v.Items = append(v.Items, iv)
+	}
+	v.Overall = overall
+	v.OverallText = statusText(overall)
+	return v
+}
+
+func (s *Store) ListTargets(now time.Time) []*TargetView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ts := make([]*Target, 0, len(s.targets))
+	for _, t := range s.targets {
+		ts = append(ts, t)
+	}
+	sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
+	out := make([]*TargetView, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, s.targetViewLocked(t, now))
+	}
+	return out
+}
+
 func cloneConfig(c Config) Config {
 	if c == nil {
 		return Config{}
@@ -292,6 +522,8 @@ func statusText(st Status) string {
 		return "已下发，待设备确认生效"
 	case StatusPartial:
 		return "部分生效，设备拒绝了部分配置"
+	case StatusSuperseded:
+		return "该版本已被更新目标替代"
 	default:
 		return "待下发"
 	}

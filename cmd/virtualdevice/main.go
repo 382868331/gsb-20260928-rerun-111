@@ -33,7 +33,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: virtualdevice -id dev-1 <poll|apply|late-report|offline|online|state> [-reject k1,k2]")
+		fmt.Fprintln(os.Stderr, "用法: virtualdevice -id dev-1 <poll|apply|late-report|offline|online|restart|state> [-reject k1,k2]")
 		os.Exit(2)
 	}
 	d := &device{server: strings.TrimRight(*serverURL, "/"), id: *id, statePath: *statePath}
@@ -69,6 +69,9 @@ func main() {
 		err = d.post("/offline", nil, nil)
 	case "online":
 		d.st.Online = true
+	case "restart":
+		// 模拟设备断电重启：本地缓存与已运行配置来自文件，重启后仍可继续未确认操作。
+		err = d.restart()
 	case "state":
 		d.printState()
 	default:
@@ -82,6 +85,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "保存本地状态失败: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func (d *device) restart() error {
+	d.st.Online = true
+	pretty, _ := json.MarshalIndent(d.st, "", "  ")
+	fmt.Printf("[设备 %s] 重启完成，从本地状态恢复：\n%s\n", d.id, string(pretty))
+	if d.st.CachedRev > 0 {
+		fmt.Printf("[设备 %s] 仍持有已下发未完成的 rev=%d，可继续 apply 上报确认\n", d.id, d.st.CachedRev)
+	}
+	return nil
 }
 
 type device struct {

@@ -25,6 +25,14 @@
 - **重启保留**：所有状态原子写入 JSON 文件（临时文件 + rename），服务重启后未完成的变更仍是 `PENDING`/`DELIVERED`，设备可继续完成。
 - **冲突可查询**：`GET /devices/{id}/conflicts` 只看未解决冲突，`?all=true` 包含历史。
 
+## 第二轮：整体生效、预演与补偿
+
+- **一组配置整体生效**：`POST /targets` 可把相关配置同时发布给多台设备。整体状态由每台设备**各自**的孪生状态聚合，取最未完成的那个：任何一台仍是 `PENDING`/`DELIVERED`/`PARTIAL`，目标都不是 `EFFECTIVE`。一台设备的成功或已下发记录绝不会算到另一台头上。
+- **只接受一部分**：设备部分拒绝时，已确认状态只保存它实际接受的键值，目标停在 `PARTIAL`；其余设备不受影响。
+- **发布前预演**：`POST /devices/{id}/preview` 返回相对当前期望的 `add` / `remove` / `change` 差异，不发布、不推进版本。
+- **失败补偿**：目标未整体生效时可用 `POST /targets/{id}/compensate` 发起补偿目标。补偿是**新的期望版本**（`kind=COMPENSATION`），必须重新下发并由设备确认，不会直接标记生效；请求体为空时默认回退到各设备最近一次已确认配置。
+- **变更记录不丢弃**：每次发布都在 `GET /devices/{id}/changes` 留痕（版本、目标、类型、状态）。离线期间被跳过或从未下发完成的版本标记为 `SUPERSEDED` 并保留；迟到的旧版本确认不能推进当前生效版本；服务或设备重新打开后继续未完成操作。
+
 ## HTTP 接口
 
 | 方法与路径 | 说明 |
@@ -36,6 +44,11 @@
 | `POST /devices/{id}/report` | 设备上报 `{rev, applied, rejected}`；迟到上报返回 `stale=true` |
 | `POST /devices/{id}/offline` | 标记设备离线（用于模拟） |
 | `GET /devices/{id}/conflicts[?all=true]` | 查询冲突 |
+| `POST /devices/{id}/preview` | 预演一份新配置的差异，不改变状态 |
+| `GET /devices/{id}/changes` | 该设备全部发布记录（含已被替代的版本） |
+| `POST /targets` | 发布多设备目标 `{"devices":{"dev-1":{...}}}` |
+| `GET /targets` / `GET /targets/{id}` | 目标列表 / 目标整体与各设备生效情况 |
+| `POST /targets/{id}/compensate` | 对未生效目标发起补偿目标（需设备重新确认） |
 
 配置值用字符串键值表示，例如 `{"temp":"22","mode":"eco"}`。
 
@@ -49,6 +62,7 @@ go run ./cmd/virtualdevice -id dev-1 poll        # 拉取最新期望
 go run ./cmd/virtualdevice -id dev-1 apply       # 应用并上报全部生效
 go run ./cmd/virtualdevice -id dev-1 apply -reject fan,temp   # 模拟拒绝部分配置
 go run ./cmd/virtualdevice -id dev-1 late-report # 模拟迟到的旧版本上报
+go run ./cmd/virtualdevice -id dev-1 restart     # 模拟设备重启，从本地缓存继续未完成操作
 go run ./cmd/virtualdevice -id dev-1 offline     # 模拟离线
 go run ./cmd/virtualdevice -id dev-1 state       # 查看设备本地缓存
 ```
@@ -61,7 +75,7 @@ go run ./cmd/virtualdevice -id dev-1 state       # 查看设备本地缓存
 
 ## 测试
 
-`tests/integration_test.go` 直接驱动 HTTP handler，覆盖：待下发→已下发→已生效、部分拒绝与冲突关闭、离线连续修改只执行最新版、迟到上报不覆盖最新目标、服务重启后未完成变更保留。
+`tests/integration_test.go` 直接驱动 HTTP handler，覆盖：待下发→已下发→已生效、部分拒绝与冲突关闭、离线连续修改只执行最新版、迟到上报不覆盖最新目标、服务重启后未完成变更保留，以及预演不落库、多设备目标整体生效、补偿目标需设备确认、离线连改+旧确认迟到+重启后被替代版本记录保留。
 
 ```bash
 go test ./...
@@ -74,4 +88,3 @@ go test ./...
 - `cmd/twinserver`：服务进程
 - `cmd/virtualdevice`：本地虚拟设备
 - `tests`：HTTP 级集成测试
-

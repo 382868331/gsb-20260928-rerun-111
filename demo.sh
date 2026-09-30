@@ -66,4 +66,32 @@ curl -s "$BASE/devices/dev-2/twin"; echo
 dev2 apply
 curl -s "$BASE/devices/dev-2/twin"; echo
 
+echo '== 7) 预演差异：不发布、不推进版本 =='
+curl -s -X POST "$BASE/devices/dev-2/preview" -H 'Content-Type: application/json' -d '{"temp":"16","mode":"eco"}'; echo
+curl -s "$BASE/devices/dev-2/changes"; echo
+
+echo '== 8) 多设备相关配置整体生效：dev-3 成功不等于 dev-4 生效 =='
+T8=$(curl -s -X POST "$BASE/targets" -H 'Content-Type: application/json" \
+  -d '{"devices":{"dev-3":{"temp":"21"},"dev-4":{"temp":"27"}}}' | sed -n 's/.*"id": *"\(T[0-9]*\)".*/\1/p')
+dev3() { "$DEMO_DIR/virtualdevice" -server "$BASE" -id dev-3 -state "$DEMO_DIR/dev-3.json" "$@"; }
+dev4() { "$DEMO_DIR/virtualdevice" -server "$BASE" -id dev-4 -state "$DEMO_DIR/dev-4.json" "$@"; }
+dev3 poll; dev3 apply
+curl -s "$BASE/targets/$T8"; echo
+dev4 poll; dev4 apply
+curl -s "$BASE/targets/$T8"; echo
+
+echo '== 9) 失败后补偿目标：默认回退到已确认状态，补偿也需设备确认 =='
+TID=$(curl -s -X POST "$BASE/targets" -H 'Content-Type: application/json' \
+  -d '{"devices":{"dev-3":{"temp":"40","fan":"max"}}}' | sed -n 's/.*"id": *"\(T[0-9]*\)".*/\1/p')
+dev3 poll; dev3 apply -reject fan
+curl -s "$BASE/targets/$TID"; echo
+CID=$(curl -s -X POST "$BASE/targets/$TID/compensate" -H 'Content-Type: application/json' -d '{}' | sed -n 's/.*"id": *"\(T[0-9]*\)".*/\1/p')
+curl -s "$BASE/targets/$CID"; echo
+dev3 poll; dev3 apply
+curl -s "$BASE/targets/$CID"; echo
+
+echo '== 10) 设备重启：从本地缓存继续未完成操作，被替代版本记录仍保留 =='
+dev4 restart
+curl -s "$BASE/devices/dev-4/changes"; echo
+
 echo; echo '演示完成'

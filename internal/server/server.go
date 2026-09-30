@@ -24,11 +24,17 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /devices", s.listDevices)
 	mux.HandleFunc("PUT /devices/{id}/desired", s.setDesired)
+	mux.HandleFunc("POST /devices/{id}/preview", s.preview)
+	mux.HandleFunc("GET /devices/{id}/changes", s.listChanges)
 	mux.HandleFunc("POST /devices/{id}/pull", s.pull)
 	mux.HandleFunc("POST /devices/{id}/report", s.report)
 	mux.HandleFunc("POST /devices/{id}/offline", s.offline)
 	mux.HandleFunc("GET /devices/{id}/twin", s.getTwin)
 	mux.HandleFunc("GET /devices/{id}/conflicts", s.listConflicts)
+	mux.HandleFunc("POST /targets", s.publishTarget)
+	mux.HandleFunc("GET /targets", s.listTargets)
+	mux.HandleFunc("GET /targets/{id}", s.getTarget)
+	mux.HandleFunc("POST /targets/{id}/compensate", s.compensate)
 	return mux
 }
 
@@ -55,17 +61,93 @@ func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "期望配置必须是 JSON 对象: "+err.Error())
 		return
 	}
-	_, rev, err := s.store.SetDesired(id, cfg, s.now())
+	t, err := s.store.SetDesired(id, cfg, s.now())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	var rev int64
+	if len(t.Items) > 0 {
+		rev = t.Items[0].Rev
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"device_id":   id,
+		"target_id":   t.ID,
 		"desired_rev": rev,
 		"status":      string(twin.StatusPending),
 		"status_text": statusText(twin.StatusPending),
 	})
+}
+
+type targetSpec struct {
+	Devices map[string]twin.Config `json:"devices"`
+}
+
+// preview 只预演差异，不发布、不推进版本。
+func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cfg := twin.Config{}
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeErr(w, http.StatusBadRequest, "期望配置必须是 JSON 对象: "+err.Error())
+		return
+	}
+	diff := s.store.Preview(id, cfg)
+	writeJSON(w, http.StatusOK, map[string]any{"device_id": id, "diff": diff})
+}
+
+func (s *Server) listChanges(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	writeJSON(w, http.StatusOK, map[string]any{"device_id": id, "changes": s.store.Changes(id)})
+}
+
+func (s *Server) publishTarget(w http.ResponseWriter, r *http.Request) {
+	spec := targetSpec{}
+	if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体必须是 {\"devices\":{...}}: "+err.Error())
+		return
+	}
+	t, err := s.store.PublishTarget(spec.Devices, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.mustTarget(t.ID))
+}
+
+func (s *Server) compensate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	spec := targetSpec{}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+			writeErr(w, http.StatusBadRequest, "请求体必须是 {\"devices\":{...}}: "+err.Error())
+			return
+		}
+	}
+	t, err := s.store.Compensate(id, spec.Devices, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.mustTarget(t.ID))
+}
+
+func (s *Server) listTargets(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"targets": s.store.ListTargets(s.now())})
+}
+
+func (s *Server) getTarget(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	v := s.mustTarget(id)
+	if v == nil {
+		writeErr(w, http.StatusNotFound, "目标不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) mustTarget(id string) *twin.TargetView {
+	v, _ := s.store.TargetView(id, s.now())
+	return v
 }
 
 func (s *Server) pull(w http.ResponseWriter, r *http.Request) {
@@ -150,6 +232,8 @@ func statusText(st twin.Status) string {
 		return "已下发，待设备确认生效"
 	case twin.StatusPartial:
 		return "部分生效，设备拒绝了部分配置"
+	case twin.StatusSuperseded:
+		return "该版本已被更新目标替代"
 	default:
 		return "待下发"
 	}
