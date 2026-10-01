@@ -28,6 +28,12 @@ type snapshot struct {
 	ChangeSeq   int64       `json:"change_seq"`
 }
 
+type PublishOptions struct {
+	Kind           ChangeKind
+	CompensatesFor string
+	Strategy       ChangeStrategy
+}
+
 func NewStore(path string) (*Store, error) {
 	s := &Store{
 		path:      path,
@@ -125,7 +131,10 @@ func (s *Store) addConflictLocked(deviceID string, reason ConflictReason, rev in
 
 // SetDesired 写入单设备目标，兼容旧接口；内部仍作为一个整体变更发布。
 func (s *Store) SetDesired(deviceID string, cfg Config, now time.Time) (*Device, int64, error) {
-	ch, err := s.PublishChange(map[string]Config{deviceID: cfg}, ChangeKindTarget, "", now)
+	ch, err := s.PublishChangeWithOptions(map[string]Config{deviceID: cfg}, PublishOptions{
+		Kind:     ChangeKindTarget,
+		Strategy: ChangeStrategySupersede,
+	}, now)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -167,6 +176,10 @@ func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Previe
 			ConfirmedRev:  d.ConfirmedRev,
 			ReportedRev:   d.ReportedRev,
 			CurrentStatus: d.Status(now),
+			Ready:         !s.deviceOperationActiveLocked(d),
+		}
+		if active := s.currentChangeForDeviceLocked(id); active != nil {
+			diff.WaitForChange = active.ID
 		}
 		for k, v := range target {
 			old, ok := d.DesiredConfig[k]
@@ -189,6 +202,11 @@ func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Previe
 
 // PublishChange 发布一组相关配置。任一设备都只确认本设备目标，不能替变更中的其他设备背书。
 func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compensatesFor string, now time.Time) (*Change, error) {
+	return s.PublishChangeWithOptions(targets, PublishOptions{Kind: kind, CompensatesFor: compensatesFor, Strategy: ChangeStrategyQueue}, now)
+}
+
+// PublishChangeWithOptions 发布一组相关配置。默认排队；只有显式 SUPERSEDE 才抢占设备当前操作。
+func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts PublishOptions, now time.Time) (*Change, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
@@ -196,12 +214,23 @@ func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compen
 	if err != nil {
 		return nil, err
 	}
+	kind := opts.Kind
+	if kind == "" {
+		kind = ChangeKindTarget
+	}
+	strategy := opts.Strategy
+	if strategy == "" {
+		strategy = ChangeStrategyQueue
+	}
+	if strategy != ChangeStrategyQueue && strategy != ChangeStrategySupersede {
+		return nil, fmt.Errorf("未知变更策略 %q", strategy)
+	}
 	if kind == ChangeKindCompensation {
-		if compensatesFor == "" {
+		if opts.CompensatesFor == "" {
 			return nil, fmt.Errorf("补偿变更必须指定原变更")
 		}
-		if _, ok := s.changes[compensatesFor]; !ok {
-			return nil, fmt.Errorf("原变更 %s 不存在", compensatesFor)
+		if _, ok := s.changes[opts.CompensatesFor]; !ok {
+			return nil, fmt.Errorf("原变更 %s 不存在", opts.CompensatesFor)
 		}
 	}
 	s.changeSeq++
@@ -213,30 +242,60 @@ func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compen
 		DeliveredRevs:   map[string]int64{},
 		DeviceResults:   map[string]ChangeDeviceResult{},
 		Status:          StatusPending,
+		Strategy:        strategy,
+		ReadyDevices:    []string{},
+		WaitingDevices:  []string{},
 		CreatedAt:       now,
 	}
 	if kind == ChangeKindCompensation {
-		ch.CompensatesFor = compensatesFor
+		ch.CompensatesFor = opts.CompensatesFor
 	}
 
+	ids := make([]string, 0, len(targets))
 	for id := range targets {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
 		d := s.deviceLocked(id)
-		if active := s.currentChangeForDeviceLocked(id); active != nil {
-			s.supersedeChangeLocked(active, now)
-			ch.Supersedes = append(ch.Supersedes, active.ID)
+		previousID := d.DesiredChangeID
+		ch.BaselineTargets[id] = cloneConfig(d.ConfirmedConfig)
+		active := s.currentChangeForDeviceLocked(id)
+		if active != nil && strategy == ChangeStrategySupersede {
+			s.supersedeDeviceInChangeLocked(active, id, now)
+			ch.Supersedes = appendUnique(ch.Supersedes, active.ID)
+			for _, queued := range s.queuedChangesForDeviceLocked(id) {
+				s.supersedeDeviceInChangeLocked(queued, id, now)
+				ch.Supersedes = appendUnique(ch.Supersedes, queued.ID)
+			}
+			active = nil
 		}
-		if d.DesiredRev > 0 && d.DeliveredRev >= d.DesiredRev && !d.isDesiredConfirmedLocked() {
+		if active != nil {
+			ch.DeviceResults[id] = ChangeDeviceResult{
+				Status:        StatusQueued,
+				DispatchState: "WAITING",
+				WaitForChange: active.ID,
+				UpdatedAt:     now,
+			}
+			ch.WaitingDevices = append(ch.WaitingDevices, id)
+			continue
+		}
+		if d.DesiredRev > 0 && d.DeliveredRev >= d.DesiredRev && s.deviceOperationActiveLocked(d) {
 			c := s.addConflictLocked(id, ReasonSuperseded, d.DesiredRev, d.DesiredConfig, now)
 			c.Open = false
 			c.ResolvedAt = &now
 		}
-		d.DesiredRev++
-		d.DesiredConfig = cloneConfig(targets[id])
-		d.DesiredChangeID = ch.ID
-		ch.BaselineTargets[id] = cloneConfig(d.ConfirmedConfig)
-		ch.DeviceResults[id] = ChangeDeviceResult{DesiredRev: d.DesiredRev, Status: StatusPending}
+		s.assignTargetToDeviceLocked(ch, id, targets[id], d, now)
+		if previousID != "" && previousID != ch.ID {
+			if previous := s.changes[previousID]; previous != nil {
+				s.supersedeDeviceInChangeLocked(previous, id, now)
+				ch.Supersedes = appendUnique(ch.Supersedes, previousID)
+			}
+		}
+		ch.ReadyDevices = append(ch.ReadyDevices, id)
 	}
 	sort.Strings(ch.Supersedes)
+	s.refreshChangeStatusLocked(ch, now)
 	s.changes[ch.ID] = ch
 	if err := s.persistLocked(); err != nil {
 		return nil, err
@@ -271,7 +330,7 @@ func (s *Store) PublishCompensation(changeID string, targets map[string]Config, 
 		targets[id] = cloneConfig(d.ConfirmedConfig)
 	}
 	s.mu.Unlock()
-	return s.PublishChange(targets, ChangeKindCompensation, changeID, now)
+	return s.PublishChangeWithOptions(targets, PublishOptions{Kind: ChangeKindCompensation, CompensatesFor: changeID, Strategy: ChangeStrategySupersede}, now)
 }
 
 // Pull 是设备拉取最新目标。只标记为“已下发”，状态不会跳到“已生效”。
@@ -284,12 +343,12 @@ func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 	if changed {
 		d.DeliveredRev = d.DesiredRev
 		d.DeliveredAt = now.UTC()
-		if ch := s.changes[d.DesiredChangeID]; ch != nil && isActiveChangeStatus(ch.Status) {
+		if ch := s.changes[d.DesiredChangeID]; ch != nil {
 			result := ch.DeviceResults[deviceID]
-			result.DesiredRev = d.DesiredRev
-			result.DeliveredRev = d.DesiredRev
-			if result.Status == "" || result.Status == StatusPending {
+			if result.DesiredRev == d.DesiredRev && (result.Status == "" || result.Status == StatusPending) {
+				result.DeliveredRev = d.DesiredRev
 				result.Status = StatusDelivered
+				result.DispatchState = "DELIVERED"
 			}
 			result.UpdatedAt = now.UTC()
 			ch.DeviceResults[deviceID] = result
@@ -311,6 +370,7 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 	d := s.deviceLocked(deviceID)
 	d.Online = true
 	now = now.UTC()
+	operationActiveBeforeReport := s.currentChangeForDeviceLocked(deviceID) != nil
 	// 记录最新观察值；上报不改变期望配置。
 	d.ReportedConfig = cloneConfig(req.Applied)
 	d.ReportedRev = req.Rev
@@ -327,7 +387,7 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 			"reported_rev": fmt.Sprint(req.Rev),
 			"desired_rev":  fmt.Sprint(d.DesiredRev),
 		}, now)
-		s.recordReportOnChangeLocked(deviceID, req, StatusPending, true, now)
+		s.recordReportOnChangeLocked(deviceID, req, StatusSuperseded, true, now)
 		if err := s.persistLocked(); err != nil {
 			return nil, nil, false, err
 		}
@@ -359,6 +419,9 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 		}
 	}
 	s.recordReportOnChangeLocked(deviceID, req, deviceStatus, false, now)
+	if operationActiveBeforeReport && !stale {
+		s.activateNextQueuedForDeviceLocked(deviceID, now)
+	}
 
 	if err := s.persistLocked(); err != nil {
 		return nil, nil, false, err
@@ -501,30 +564,110 @@ func (s *Store) currentChangeForDeviceLocked(deviceID string) *Change {
 		return nil
 	}
 	ch := s.changes[d.DesiredChangeID]
-	if ch == nil || ch.Status == StatusSuperseded {
+	if ch == nil {
+		return nil
+	}
+	result := ch.DeviceResults[deviceID]
+	if result.DesiredRev != d.DesiredRev || !isDeviceOperationStatus(result.Status) {
 		return nil
 	}
 	return ch
 }
 
-func isActiveChangeStatus(st Status) bool {
-	return st == StatusPending || st == StatusDelivered || st == StatusPartial || st == StatusFailed
+func isDeviceOperationStatus(st Status) bool {
+	return st == StatusPending || st == StatusDelivered
 }
 
-func (s *Store) supersedeChangeLocked(ch *Change, now time.Time) {
-	changed := ch.Status != StatusSuperseded
-	for id, result := range ch.DeviceResults {
-		if result.Status != StatusEffective {
-			result.Status = StatusSuperseded
-			result.UpdatedAt = now
-			ch.DeviceResults[id] = result
-			changed = true
+func (s *Store) deviceOperationActiveLocked(d *Device) bool {
+	return d.DesiredRev > 0 && !d.isDesiredConfirmedLocked()
+}
+
+func (s *Store) assignTargetToDeviceLocked(ch *Change, deviceID string, target Config, d *Device, now time.Time) {
+	d.DesiredRev++
+	d.DesiredConfig = cloneConfig(target)
+	d.DesiredChangeID = ch.ID
+	ch.DeviceResults[deviceID] = ChangeDeviceResult{
+		DesiredRev:    d.DesiredRev,
+		Status:        StatusPending,
+		DispatchState: "READY",
+		UpdatedAt:     now,
+	}
+}
+
+func (s *Store) queuedChangesForDeviceLocked(deviceID string) []*Change {
+	out := []*Change{}
+	for _, ch := range s.changes {
+		if result, ok := ch.DeviceResults[deviceID]; ok && result.Status == StatusQueued {
+			out = append(out, ch)
 		}
 	}
-	ch.Status = StatusSuperseded
-	if changed || ch.SupersededAt == nil {
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *Store) activateNextQueuedForDeviceLocked(deviceID string, now time.Time) {
+	if s.currentChangeForDeviceLocked(deviceID) != nil {
+		return
+	}
+	queued := s.queuedChangesForDeviceLocked(deviceID)
+	if len(queued) == 0 {
+		return
+	}
+	next := queued[0]
+	d := s.deviceLocked(deviceID)
+	d.DesiredRev++
+	d.DesiredConfig = cloneConfig(next.Targets[deviceID])
+	d.DesiredChangeID = next.ID
+	result := next.DeviceResults[deviceID]
+	result.DesiredRev = d.DesiredRev
+	result.Status = StatusPending
+	result.DispatchState = "READY"
+	result.WaitForChange = ""
+	result.UpdatedAt = now
+	next.DeviceResults[deviceID] = result
+	next.WaitingDevices = removeString(next.WaitingDevices, deviceID)
+	next.ReadyDevices = appendUnique(next.ReadyDevices, deviceID)
+	s.refreshChangeStatusLocked(next, now)
+}
+
+func (s *Store) supersedeDeviceInChangeLocked(ch *Change, deviceID string, now time.Time) {
+	result := ch.DeviceResults[deviceID]
+	if result.Status == StatusEffective {
+		result.DispatchState = "SUPERSEDED"
+		result.UpdatedAt = now
+		ch.DeviceResults[deviceID] = result
+	} else {
+		result.Status = StatusSuperseded
+		result.DispatchState = "SUPERSEDED"
+		result.WaitForChange = ""
+		result.UpdatedAt = now
+		ch.DeviceResults[deviceID] = result
+	}
+	ch.WaitingDevices = removeString(ch.WaitingDevices, deviceID)
+	ch.ReadyDevices = removeString(ch.ReadyDevices, deviceID)
+	s.refreshChangeStatusLocked(ch, now)
+	if ch.Status == StatusSuperseded && ch.SupersededAt == nil {
 		ch.SupersededAt = &now
 	}
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func removeString(values []string, want string) []string {
+	out := values[:0]
+	for _, value := range values {
+		if value != want {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func (s *Store) recordReportOnChangeLocked(deviceID string, req ReportRequest, resultStatus Status, stale bool, now time.Time) {
@@ -550,19 +693,38 @@ func (s *Store) recordReportOnChangeLocked(deviceID string, req ReportRequest, r
 	result.Rejected = cloneConfig(req.Rejected)
 	result.Stale = stale
 	result.UpdatedAt = now
-	if isActiveChangeStatus(ch.Status) {
+	if isDeviceOperationStatus(result.Status) || (result.Status == "") {
 		result.Status = resultStatus
+		if resultStatus == StatusEffective {
+			result.DispatchState = "EFFECTIVE"
+		} else if stale {
+			result.DispatchState = "STALE"
+		}
 		ch.DeviceResults[deviceID] = result
 		s.refreshChangeStatusLocked(ch, now)
 	} else {
-		if result.Status != StatusEffective {
+		if stale && resultStatus != StatusEffective && result.Status != StatusEffective {
 			result.Status = StatusSuperseded
+			result.DispatchState = "STALE"
 		}
 		ch.DeviceResults[deviceID] = result
+		s.refreshChangeStatusLocked(ch, now)
 	}
 }
 
 func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
+	ch.ReadyDevices = ch.ReadyDevices[:0]
+	ch.WaitingDevices = ch.WaitingDevices[:0]
+	for id, result := range ch.DeviceResults {
+		switch result.Status {
+		case StatusQueued:
+			ch.WaitingDevices = append(ch.WaitingDevices, id)
+		case StatusPending, StatusDelivered:
+			ch.ReadyDevices = append(ch.ReadyDevices, id)
+		}
+	}
+	sort.Strings(ch.ReadyDevices)
+	sort.Strings(ch.WaitingDevices)
 	hasStatus := func(want Status) bool {
 		for _, result := range ch.DeviceResults {
 			if result.Status == want {
@@ -572,12 +734,32 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 		return false
 	}
 	allEffective := true
+	allTerminalReplaced := true
+	hasSuperseded := false
+	allTerminal := true
 	for _, result := range ch.DeviceResults {
 		if result.Status != StatusEffective {
 			allEffective = false
 		}
+		if result.Status != StatusEffective && result.Status != StatusSuperseded {
+			allTerminalReplaced = false
+		}
+		if result.Status == StatusSuperseded {
+			hasSuperseded = true
+		}
+		if result.Status == StatusEffective && result.DispatchState == "SUPERSEDED" {
+			hasSuperseded = true
+		}
+		if result.Status == StatusQueued || isDeviceOperationStatus(result.Status) {
+			allTerminal = false
+		}
 	}
 	switch {
+	case allTerminalReplaced && hasSuperseded:
+		ch.Status = StatusSuperseded
+		if ch.SupersededAt == nil {
+			ch.SupersededAt = &now
+		}
 	case allEffective:
 		ch.Status = StatusEffective
 		if ch.EffectiveAt == nil {
@@ -587,6 +769,13 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 		ch.Status = StatusPartial
 	case hasStatus(StatusFailed):
 		ch.Status = StatusFailed
+	case allTerminal:
+		ch.Status = StatusSuperseded
+		if ch.SupersededAt == nil {
+			ch.SupersededAt = &now
+		}
+	case len(ch.WaitingDevices) > 0:
+		ch.Status = StatusQueued
 	case hasStatus(StatusDelivered):
 		ch.Status = StatusDelivered
 	default:
@@ -618,6 +807,8 @@ func cloneChange(ch *Change) *Change {
 		cp.DeviceResults[id] = result
 	}
 	cp.Supersedes = append([]string(nil), ch.Supersedes...)
+	cp.ReadyDevices = append([]string(nil), ch.ReadyDevices...)
+	cp.WaitingDevices = append([]string(nil), ch.WaitingDevices...)
 	return &cp
 }
 
@@ -644,6 +835,8 @@ func statusText(st Status) string {
 		return "未生效，设备确认失败"
 	case StatusSuperseded:
 		return "已被新目标替代，历史保留"
+	case StatusQueued:
+		return "等待先前设备操作结束"
 	default:
 		return "待下发"
 	}

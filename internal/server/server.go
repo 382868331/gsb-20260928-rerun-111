@@ -76,7 +76,8 @@ func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
 }
 
 type changeRequest struct {
-	Targets map[string]twin.Config `json:"targets"`
+	Targets  map[string]twin.Config `json:"targets"`
+	Strategy twin.ChangeStrategy    `json:"strategy"`
 }
 
 func decodeTargets(r *http.Request) (map[string]twin.Config, error) {
@@ -102,12 +103,16 @@ func (s *Server) previewChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishChange(w http.ResponseWriter, r *http.Request) {
-	targets, err := decodeTargets(r)
-	if err != nil {
+	var req changeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求必须是 {\"targets\":{\"设备ID\":{...}}} JSON: "+err.Error())
 		return
 	}
-	ch, err := s.store.PublishChange(targets, twin.ChangeKindTarget, "", s.now())
+	targets := req.Targets
+	ch, err := s.store.PublishChangeWithOptions(targets, twin.PublishOptions{
+		Kind:     twin.ChangeKindTarget,
+		Strategy: req.Strategy,
+	}, s.now())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -229,6 +234,8 @@ func statusText(st twin.Status) string {
 		return "未生效，设备确认失败"
 	case twin.StatusSuperseded:
 		return "已被新目标替代，历史保留"
+	case twin.StatusQueued:
+		return "等待先前设备操作结束"
 	default:
 		return "待下发"
 	}

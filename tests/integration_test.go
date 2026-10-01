@@ -115,6 +115,12 @@ func (c testClient) publish(targets map[string]twin.Config) twin.Change {
 	return ch
 }
 
+func (c testClient) publishStrategy(targets map[string]twin.Config, strategy twin.ChangeStrategy) twin.Change {
+	var ch twin.Change
+	c.do(http.MethodPost, "/changes", map[string]any{"targets": targets, "strategy": string(strategy)}, &ch)
+	return ch
+}
+
 func (c testClient) change(id string) twin.Change {
 	var ch twin.Change
 	c.do(http.MethodGet, "/changes/"+id, nil, &ch)
@@ -445,5 +451,110 @@ func TestConflictQueryForUnknownDeviceIsEmpty(t *testing.T) {
 	c, _, _ := newHarness(t)
 	if got := c.conflicts("ghost", false); len(got) != 0 {
 		t.Fatalf("未知设备冲突列表应为空，得到 %d", len(got))
+	}
+}
+
+func TestOverlappingGroupsQueueUntilPriorOperationFinishes(t *testing.T) {
+	c, _, dbPath := newHarness(t)
+	first := c.publish(map[string]twin.Config{
+		"dev-a": {"temp": "20"},
+		"dev-b": {"temp": "20"},
+	})
+	c.pull("dev-a")
+	c.pull("dev-b")
+	c.report("dev-a", twin.ReportRequest{Rev: first.DeviceResults["dev-a"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	c.report("dev-b", twin.ReportRequest{Rev: first.DeviceResults["dev-b"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+
+	second := c.publish(map[string]twin.Config{
+		"dev-a": {"temp": "22"},
+		"dev-b": {"temp": "22"},
+	})
+	c.pull("dev-a")
+	c.pull("dev-b")
+	c.do(http.MethodPost, "/devices/dev-b/offline", nil, nil)
+
+	third := c.publish(map[string]twin.Config{
+		"dev-a": {"temp": "23"},
+		"dev-c": {"temp": "23"},
+	})
+	gotThird := c.change(third.ID)
+	if gotThird.Status != twin.StatusQueued || gotThird.DeviceResults["dev-a"].Status != twin.StatusQueued || gotThird.DeviceResults["dev-a"].WaitForChange != second.ID {
+		t.Fatalf("dev-a 应等待 second 完成，得到 %+v", gotThird)
+	}
+	if len(gotThird.ReadyDevices) != 1 || gotThird.ReadyDevices[0] != "dev-c" || len(gotThird.WaitingDevices) != 1 || gotThird.WaitingDevices[0] != "dev-a" {
+		t.Fatalf("应展示可继续和必须等待的设备，得到 ready=%v waiting=%v", gotThird.ReadyDevices, gotThird.WaitingDevices)
+	}
+
+	c.pull("dev-c")
+	c.report("dev-c", twin.ReportRequest{Rev: third.DeviceResults["dev-c"].DesiredRev, Applied: twin.Config{"temp": "23"}})
+	if got := c.change(third.ID).Status; got != twin.StatusQueued {
+		t.Fatalf("dev-c 已确认但 dev-a 未轮到时，third 应为 QUEUED，得到 %s", got)
+	}
+
+	c.report("dev-a", twin.ReportRequest{Rev: second.DeviceResults["dev-a"].DesiredRev, Applied: twin.Config{"temp": "22"}})
+	dup := c.report("dev-a", twin.ReportRequest{Rev: second.DeviceResults["dev-a"].DesiredRev, Applied: twin.Config{"temp": "22"}})
+	if stale, _ := dup["stale"].(bool); !stale {
+		t.Fatalf("dev-a 已进入 third 后，second 的重复确认必须 stale，得到 %v", dup)
+	}
+	if got := c.change(second.ID).DeviceResults["dev-a"].Status; got != twin.StatusEffective {
+		t.Fatalf("second 的 dev-a 成功记录不能被重复确认改写，得到 %s", got)
+	}
+	v := c.twin("dev-a")
+	third = c.change(third.ID)
+	if v.DesiredRev != third.DeviceResults["dev-a"].DesiredRev || v.DesiredConfig["temp"] != "23" || v.ConfirmedConfig["temp"] != "22" {
+		t.Fatalf("重复旧确认不能改变当前目标或确认状态，得到 %+v", v)
+	}
+
+	c2 := newHarnessFromPath(t, dbPath)
+	c2.pull("dev-b")
+	c2.report("dev-b", twin.ReportRequest{Rev: second.DeviceResults["dev-b"].DesiredRev, Applied: twin.Config{"temp": "22"}})
+	if got := c2.change(second.ID).Status; got != twin.StatusEffective {
+		t.Fatalf("离线设备恢复并反馈后 second 才应 EFFECTIVE，得到 %s", got)
+	}
+	c2.pull("dev-a")
+	c2.report("dev-a", twin.ReportRequest{Rev: third.DeviceResults["dev-a"].DesiredRev, Applied: twin.Config{"temp": "23"}})
+	if got := c2.change(third.ID).Status; got != twin.StatusEffective {
+		t.Fatalf("重启和排队接续后所有必要反馈齐全才应 EFFECTIVE，得到 %s", got)
+	}
+	for id, want := range map[string]string{"dev-a": "23", "dev-b": "22", "dev-c": "23"} {
+		v := c2.twin(id)
+		if v.Status != twin.StatusEffective || v.DesiredConfig["temp"] != want || v.ReportedConfig["temp"] != want || v.ConfirmedConfig["temp"] != want {
+			t.Fatalf("%s 最终目标、观察和确认应均为 %s，得到 %+v", id, want, v)
+		}
+	}
+}
+
+func TestExplicitSupersedePreservesPartialDeviceHistory(t *testing.T) {
+	c, _, _ := newHarness(t)
+	old := c.publish(map[string]twin.Config{
+		"dev-a": {"temp": "20"},
+		"dev-b": {"temp": "20"},
+	})
+	c.pull("dev-a")
+	c.pull("dev-b")
+	c.report("dev-a", twin.ReportRequest{Rev: old.DeviceResults["dev-a"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	c.report("dev-b", twin.ReportRequest{
+		Rev:      old.DeviceResults["dev-b"].DesiredRev,
+		Applied:  twin.Config{},
+		Rejected: twin.Config{"temp": "20"},
+	})
+
+	next := c.publishStrategy(map[string]twin.Config{
+		"dev-a": {"temp": "24"},
+		"dev-b": {"temp": "24"},
+		"dev-c": {"temp": "24"},
+	}, twin.ChangeStrategySupersede)
+	historical := c.change(old.ID)
+	if historical.Status != twin.StatusSuperseded {
+		t.Fatalf("显式取代后旧组应为 SUPERSEDED，得到 %s", historical.Status)
+	}
+	if r := historical.DeviceResults["dev-a"]; r.Status != twin.StatusEffective || r.AppliedConfig["temp"] != "20" {
+		t.Fatalf("已成功设备的实际确认应保留，得到 %+v", r)
+	}
+	if r := historical.DeviceResults["dev-b"]; r.Status != twin.StatusSuperseded || r.Rejected["temp"] != "20" {
+		t.Fatalf("未完成设备的拒绝收尾结果应保留，得到 %+v", r)
+	}
+	if next.Status != twin.StatusPending || len(next.ReadyDevices) != 3 {
+		t.Fatalf("显式取代后新组三台设备都应可继续，得到 %+v", next)
 	}
 }

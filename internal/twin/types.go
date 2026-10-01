@@ -21,6 +21,8 @@ const (
 	StatusFailed Status = "FAILED"
 	// StatusSuperseded 目标尚未整体完成就被新目标替代，只保留历史。
 	StatusSuperseded Status = "SUPERSEDED"
+	// StatusQueued 目标正在等待同一设备先前操作结束，尚未生成期望版本。
+	StatusQueued Status = "QUEUED"
 )
 
 type ChangeKind string
@@ -28,6 +30,15 @@ type ChangeKind string
 const (
 	ChangeKindTarget       ChangeKind = "TARGET"
 	ChangeKindCompensation ChangeKind = "COMPENSATION"
+)
+
+type ChangeStrategy string
+
+const (
+	// ChangeStrategyQueue 不抢占设备尚未结束的操作，按发布顺序等待。
+	ChangeStrategyQueue ChangeStrategy = "QUEUE"
+	// ChangeStrategySupersede 显式取代设备尚未结束的操作，立即发布新目标。
+	ChangeStrategySupersede ChangeStrategy = "SUPERSEDE"
 )
 
 // Change 是一次面向一组设备整体发布的配置目标。
@@ -40,6 +51,9 @@ type Change struct {
 	DeliveredRevs   map[string]int64              `json:"delivered_revs"`
 	DeviceResults   map[string]ChangeDeviceResult `json:"device_results"`
 	Status          Status                        `json:"status"`
+	Strategy        ChangeStrategy                `json:"strategy"`
+	ReadyDevices    []string                      `json:"ready_devices,omitempty"`
+	WaitingDevices  []string                      `json:"waiting_devices,omitempty"`
 	Supersedes      []string                      `json:"supersedes,omitempty"`
 	CompensatesFor  string                        `json:"compensates_for,omitempty"`
 	CreatedAt       time.Time                     `json:"created_at"`
@@ -54,6 +68,8 @@ type ChangeDeviceResult struct {
 	AppliedConfig Config    `json:"applied_config"`
 	Rejected      Config    `json:"rejected,omitempty"`
 	Status        Status    `json:"status"`
+	DispatchState string    `json:"dispatch_state,omitempty"`
+	WaitForChange string    `json:"wait_for_change,omitempty"`
 	Stale         bool      `json:"stale,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -85,7 +101,7 @@ func (d *Device) Status(now time.Time) Status {
 	if len(d.DesiredConfig) == 0 {
 		return StatusPending
 	}
-	if d.ConfirmedRev >= d.DesiredRev && configEqual(d.ConfirmedConfig, d.DesiredConfig) {
+	if d.DesiredRev > 0 && d.ConfirmedRev >= d.DesiredRev && configEqual(d.ConfirmedConfig, d.DesiredConfig) {
 		return StatusEffective
 	}
 	if d.ReportedRev == d.DesiredRev && !d.ReportedAt.IsZero() {
@@ -147,6 +163,8 @@ type DeviceDiff struct {
 	ConfirmedRev  int64    `json:"confirmed_rev"`
 	ReportedRev   int64    `json:"reported_rev"`
 	CurrentStatus Status   `json:"current_status"`
+	Ready         bool     `json:"ready"`
+	WaitForChange string   `json:"wait_for_change,omitempty"`
 }
 
 type Preview struct {
