@@ -21,6 +21,18 @@ const (
 	StatusFailed Status = "FAILED"
 	// StatusSuperseded 目标尚未整体完成就被新目标替代，只保留历史。
 	StatusSuperseded Status = "SUPERSEDED"
+	// StatusQueued 变更已受理，但设备还有未结束的先前操作，必须排队等待。
+	StatusQueued Status = "QUEUED"
+)
+
+// PublishMode 决定新变更遇到设备尚有未结束操作时如何处理。
+type PublishMode string
+
+const (
+	// PublishModeSupersede 显式取代：立即替换当前目标，旧变更保留为历史。
+	PublishModeSupersede PublishMode = "supersede"
+	// PublishModeQueue 排队：等先前操作结束后再激活，不覆盖未完成目标。
+	PublishModeQueue PublishMode = "queue"
 )
 
 type ChangeKind string
@@ -41,6 +53,8 @@ type Change struct {
 	DeviceResults   map[string]ChangeDeviceResult `json:"device_results"`
 	Status          Status                        `json:"status"`
 	Supersedes      []string                      `json:"supersedes,omitempty"`
+	SupersededBy    string                        `json:"superseded_by,omitempty"`
+	ClosureNote     string                        `json:"closure_note,omitempty"`
 	CompensatesFor  string                        `json:"compensates_for,omitempty"`
 	CreatedAt       time.Time                     `json:"created_at"`
 	EffectiveAt     *time.Time                    `json:"effective_at,omitempty"`
@@ -48,14 +62,17 @@ type Change struct {
 }
 
 type ChangeDeviceResult struct {
-	DesiredRev    int64     `json:"desired_rev"`
-	DeliveredRev  int64     `json:"delivered_rev"`
-	ReportedRev   int64     `json:"reported_rev"`
-	AppliedConfig Config    `json:"applied_config"`
-	Rejected      Config    `json:"rejected,omitempty"`
-	Status        Status    `json:"status"`
-	Stale         bool      `json:"stale,omitempty"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	DesiredRev    int64  `json:"desired_rev"`
+	DeliveredRev  int64  `json:"delivered_rev"`
+	ReportedRev   int64  `json:"reported_rev"`
+	AppliedConfig Config `json:"applied_config"`
+	Rejected      Config `json:"rejected,omitempty"`
+	Status        Status `json:"status"`
+	// PriorStatus 记录结果被取代前的真实收尾状态（如 DELIVERED/FAILED），
+	// 避免“已替代”掩盖设备最后实际确认到哪一步。
+	PriorStatus Status    `json:"prior_status,omitempty"`
+	Stale       bool      `json:"stale,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Device 保存一台设备的孪生三态：期望、已上报、已确认。
@@ -78,6 +95,8 @@ type Device struct {
 	ConfirmedConfig Config    `json:"confirmed_config"`
 	ConfirmedRev    int64     `json:"confirmed_rev"`
 	ConfirmedAt     time.Time `json:"confirmed_at"`
+	// QueuedChangeIDs 是等待先前操作结束后依次激活的变更队列。
+	QueuedChangeIDs []string `json:"queued_change_ids,omitempty"`
 }
 
 // Status 计算当前期望版本所处状态。
@@ -147,6 +166,9 @@ type DeviceDiff struct {
 	ConfirmedRev  int64    `json:"confirmed_rev"`
 	ReportedRev   int64    `json:"reported_rev"`
 	CurrentStatus Status   `json:"current_status"`
+	// WouldQueue 为 true 表示以排队模式发布时该设备必须等待先前操作结束。
+	WouldQueue        bool   `json:"would_queue"`
+	BlockedByChangeID string `json:"blocked_by_change_id,omitempty"`
 }
 
 type Preview struct {
@@ -174,6 +196,25 @@ type TwinView struct {
 	ReportedRejected Config `json:"reported_rejected,omitempty"`
 	ConfirmedRev     int64  `json:"confirmed_rev"`
 	ConfirmedConfig  Config `json:"confirmed_config"`
+	// AwaitingFeedback 为 true 表示当前目标已下发或待下发、仍在等设备反馈，
+	// 新变更默认应排队而不是覆盖。
+	AwaitingFeedback bool     `json:"awaiting_feedback"`
+	QueuedChanges    []string `json:"queued_changes,omitempty"`
+}
+
+// VerifyView 核对设备最终目标与真实观察状态是否一致。
+type VerifyView struct {
+	DeviceID                string   `json:"device_id"`
+	DesiredRev              int64    `json:"desired_rev"`
+	DesiredConfig           Config   `json:"desired_config"`
+	ReportedRev             int64    `json:"reported_rev"`
+	ReportedConfig          Config   `json:"reported_config"`
+	ConfirmedRev            int64    `json:"confirmed_rev"`
+	ConfirmedConfig         Config   `json:"confirmed_config"`
+	ObservedMatchesDesired  bool     `json:"observed_matches_desired"`
+	ConfirmedMatchesDesired bool     `json:"confirmed_matches_desired"`
+	Final                   bool     `json:"final"`
+	QueuedChanges           []string `json:"queued_changes,omitempty"`
 }
 
 func configEqual(a, b Config) bool {

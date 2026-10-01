@@ -65,4 +65,25 @@ sleep 0.5
 dev dev-c resume
 curl -s "$BASE/devices/dev-c/twin"; echo
 
+echo '== 7) 变更排队：一台设备离线未确认时，新变更对空闲设备立即生效、对忙碌设备排队 =='
+Q1=$(curl -s -X POST "$BASE/changes" -H 'Content-Type: application/json' +  -d '{"targets":{"dev-a":{"temp":"21"},"dev-b":{"temp":"21"}}}')
+Q1_ID=$(printf '%s' "$Q1" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+dev dev-a poll; dev dev-a apply
+dev dev-b poll; dev dev-b offline   # dev-b 已下发未确认就离线
+Q2=$(curl -s -X POST "$BASE/changes" -H 'Content-Type: application/json' +  -d '{"mode":"queue","targets":{"dev-a":{"temp":"25"},"dev-b":{"temp":"25"}}}')
+echo "$Q2"
+Q2_ID=$(printf '%s' "$Q2" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+curl -s "$BASE/devices/dev-b/twin"; echo   # awaiting_feedback=true 且 queued_changes 非空
+dev dev-a poll; dev dev-a apply            # dev-a 空闲，立即继续新目标
+dev dev-b online; dev dev-b poll; dev dev-b resume   # dev-b 先完成先前操作
+dev dev-b poll; dev dev-b resume           # 排队变更自动激活后再确认
+curl -s "$BASE/changes/$Q2_ID"; echo
+
+echo '== 8) 显式取代保留收尾结果；重复确认幂等；核对最终目标与观察状态 =='
+curl -s -X POST "$BASE/changes" -H 'Content-Type: application/json' +  -d '{"mode":"supersede","targets":{"dev-b":{"temp":"27"}}}'; echo
+curl -s "$BASE/changes/$Q1_ID"; echo       # 被取代变更保留已确认部分与 closure_note
+dev dev-b poll; dev dev-b resume; dev dev-b resume   # 重复确认不重复产生冲突
+curl -s "$BASE/devices/dev-b/verify"; echo
+curl -s "$BASE/devices/dev-a/verify"; echo
+
 echo; echo '演示完成'

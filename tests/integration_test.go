@@ -115,6 +115,18 @@ func (c testClient) publish(targets map[string]twin.Config) twin.Change {
 	return ch
 }
 
+func (c testClient) publishWithMode(targets map[string]twin.Config, mode string) twin.Change {
+	var ch twin.Change
+	c.do(http.MethodPost, "/changes", map[string]any{"targets": targets, "mode": mode}, &ch)
+	return ch
+}
+
+func (c testClient) verify(id string) twin.VerifyView {
+	var v twin.VerifyView
+	c.do(http.MethodGet, "/devices/"+id+"/verify", nil, &v)
+	return v
+}
+
 func (c testClient) change(id string) twin.Change {
 	var ch twin.Change
 	c.do(http.MethodGet, "/changes/"+id, nil, &ch)
@@ -445,5 +457,182 @@ func TestConflictQueryForUnknownDeviceIsEmpty(t *testing.T) {
 	c, _, _ := newHarness(t)
 	if got := c.conflicts("ghost", false); len(got) != 0 {
 		t.Fatalf("未知设备冲突列表应为空，得到 %d", len(got))
+	}
+}
+
+// 变更排队：两次变更涉及同一台设备、另一台设备离线时，空闲设备立即继续，
+// 忙碌设备排队等待先前操作结束；先前操作完成后排队变更自动激活，整组仍需全部确认。
+func TestQueuedChangeWaitsForPriorOperation(t *testing.T) {
+	c, _, _ := newHarness(t)
+	first := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "20"},
+		"dev-2": {"temp": "20"},
+	})
+	c.pull("dev-1")
+	c.pull("dev-2")
+	c.report("dev-1", twin.ReportRequest{Rev: first.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	c.do(http.MethodPost, "/devices/dev-2/offline", nil, nil) // dev-2 已下发未确认就离线
+
+	second := c.publishWithMode(map[string]twin.Config{
+		"dev-1": {"temp": "24"},
+		"dev-2": {"temp": "24"},
+	}, "queue")
+	if second.DeviceResults["dev-2"].Status != twin.StatusQueued {
+		t.Fatalf("dev-2 有未结束操作，应排队，得到 %+v", second.DeviceResults["dev-2"])
+	}
+	if second.DeviceResults["dev-1"].Status != twin.StatusPending || second.DeviceResults["dev-1"].DesiredRev == 0 {
+		t.Fatalf("dev-1 空闲应立即继续，得到 %+v", second.DeviceResults["dev-1"])
+	}
+	v2 := c.twin("dev-2")
+	if !v2.AwaitingFeedback || len(v2.QueuedChanges) != 1 || v2.QueuedChanges[0] != second.ID {
+		t.Fatalf("dev-2 应显示等待先前反馈且有排队变更，得到 %+v", v2)
+	}
+	if v2.DesiredConfig["temp"] != "20" {
+		t.Fatalf("排队不能覆盖 dev-2 未完成的目标，得到 %+v", v2)
+	}
+	if got := c.twin("dev-1").DesiredConfig["temp"]; got != "24" {
+		t.Fatalf("dev-1 应已切换到新目标 temp=24，得到 %s", got)
+	}
+	if c.change(second.ID).Status == twin.StatusEffective {
+		t.Fatal("dev-2 尚未参与，整组不能生效")
+	}
+
+	// dev-2 恢复：先完成先前操作，排队变更随后自动激活。
+	rev2, cfg2 := c.pull("dev-2")
+	if cfg2["temp"] != "20" {
+		t.Fatalf("dev-2 恢复后仍应先拿到旧目标 temp=20，得到 rev=%d cfg=%v", rev2, cfg2)
+	}
+	c.report("dev-2", twin.ReportRequest{Rev: rev2, Applied: twin.Config{"temp": "20"}})
+	done := c.change(first.ID)
+	if done.EffectiveAt == nil || done.DeviceResults["dev-1"].Status != twin.StatusEffective || done.DeviceResults["dev-2"].Status != twin.StatusEffective {
+		t.Fatalf("先前变更的实际确认结果必须保留，得到 %+v", done)
+	}
+	v2 = c.twin("dev-2")
+	if len(v2.QueuedChanges) != 0 || v2.DesiredConfig["temp"] != "24" {
+		t.Fatalf("先前操作结束后排队变更应激活，得到 %+v", v2)
+	}
+	rev2, cfg2 = c.pull("dev-2")
+	if cfg2["temp"] != "24" {
+		t.Fatalf("dev-2 应拉到排队激活的新目标 temp=24，得到 rev=%d cfg=%v", rev2, cfg2)
+	}
+	c.report("dev-1", twin.ReportRequest{Rev: second.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "24"}})
+	if c.change(second.ID).Status == twin.StatusEffective {
+		t.Fatal("dev-2 未确认前整组不能生效")
+	}
+	c.report("dev-2", twin.ReportRequest{Rev: rev2, Applied: twin.Config{"temp": "24"}})
+	if got := c.change(second.ID).Status; got != twin.StatusEffective {
+		t.Fatalf("所有设备确认后整组才生效，得到 %s", got)
+	}
+}
+
+// 显式取代：被取代的变更保留实际已确认部分与收尾状态，不能改写成失败。
+func TestExplicitSupersedePreservesClosure(t *testing.T) {
+	c, _, _ := newHarness(t)
+	first := c.publish(map[string]twin.Config{
+		"dev-1": {"temp": "20"},
+		"dev-2": {"temp": "20"},
+	})
+	c.pull("dev-1")
+	c.pull("dev-2")
+	c.report("dev-1", twin.ReportRequest{Rev: first.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+
+	second := c.publishWithMode(map[string]twin.Config{
+		"dev-1": {"temp": "26"},
+		"dev-2": {"temp": "26"},
+	}, "supersede")
+	old := c.change(first.ID)
+	if old.Status != twin.StatusSuperseded || old.SupersededBy != second.ID || old.ClosureNote == "" {
+		t.Fatalf("旧变更应标记被谁取代并留下收尾说明，得到 %+v", old)
+	}
+	if old.DeviceResults["dev-1"].Status != twin.StatusEffective || old.DeviceResults["dev-1"].AppliedConfig["temp"] != "20" {
+		t.Fatalf("已确认部分必须原样保留，得到 %+v", old.DeviceResults["dev-1"])
+	}
+	r2 := old.DeviceResults["dev-2"]
+	if r2.Status != twin.StatusSuperseded || r2.PriorStatus != twin.StatusDelivered {
+		t.Fatalf("未确认设备的收尾状态应保留在 prior_status，得到 %+v", r2)
+	}
+	if got := c.twin("dev-2").DesiredConfig["temp"]; got != "26" {
+		t.Fatalf("显式取代应立即切换目标，得到 %s", got)
+	}
+}
+
+// 重复确认：同一版本的重复上报幂等，不重复产生冲突、不改变组状态。
+func TestDuplicateConfirmationIsIdempotent(t *testing.T) {
+	c, _, _ := newHarness(t)
+	ch := c.publish(map[string]twin.Config{"dev-1": {"temp": "22"}})
+	rev := ch.DeviceResults["dev-1"].DesiredRev
+	c.pull("dev-1")
+	c.report("dev-1", twin.ReportRequest{Rev: rev, Applied: twin.Config{"temp": "22"}})
+	first := c.change(ch.ID)
+	c.report("dev-1", twin.ReportRequest{Rev: rev, Applied: twin.Config{"temp": "22"}})
+	second := c.change(ch.ID)
+	if second.Status != twin.StatusEffective || !second.EffectiveAt.Equal(*first.EffectiveAt) {
+		t.Fatalf("重复确认不能改变已生效结果，得到 %+v", second)
+	}
+	if got := c.conflicts("dev-1", true); len(got) != 0 {
+		t.Fatalf("重复精确确认不应产生冲突，得到 %+v", got)
+	}
+
+	// 重复的部分拒绝也只保留一条未解决冲突。
+	c.setDesired("dev-1", twin.Config{"temp": "22", "fan": "high"})
+	c.pull("dev-1")
+	v := c.twin("dev-1")
+	rej := twin.ReportRequest{Rev: v.DesiredRev, Applied: twin.Config{"temp": "22"}, Rejected: twin.Config{"fan": "high"}}
+	c.report("dev-1", rej)
+	c.report("dev-1", rej)
+	open := c.conflicts("dev-1", false)
+	if len(open) != 1 || open[0].Reason != twin.ReasonRejected {
+		t.Fatalf("重复拒绝应只记录一条冲突，得到 %+v", open)
+	}
+}
+
+// 重启接续：排队中的变更随快照恢复，先前操作完成后仍能激活。
+func TestQueuedChangeSurvivesRestart(t *testing.T) {
+	c, _, dbPath := newHarness(t)
+	first := c.publish(map[string]twin.Config{"dev-1": {"temp": "20"}})
+	c.pull("dev-1")
+	second := c.publishWithMode(map[string]twin.Config{"dev-1": {"temp": "25"}}, "queue")
+	if second.DeviceResults["dev-1"].Status != twin.StatusQueued {
+		t.Fatalf("已下发未确认时应排队，得到 %+v", second.DeviceResults["dev-1"])
+	}
+
+	c2 := newHarnessFromPath(t, dbPath)
+	if got := c2.change(second.ID).Status; got != twin.StatusQueued {
+		t.Fatalf("重启后排队变更应恢复为 QUEUED，得到 %s", got)
+	}
+	if v := c2.twin("dev-1"); len(v.QueuedChanges) != 1 {
+		t.Fatalf("重启后设备队列应保留，得到 %+v", v)
+	}
+	c2.report("dev-1", twin.ReportRequest{Rev: first.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "20"}})
+	v := c2.twin("dev-1")
+	if v.DesiredConfig["temp"] != "25" || len(v.QueuedChanges) != 0 {
+		t.Fatalf("重启后先前操作完成应激活排队变更，得到 %+v", v)
+	}
+	rev, _ := c2.pull("dev-1")
+	c2.report("dev-1", twin.ReportRequest{Rev: rev, Applied: twin.Config{"temp": "25"}})
+	if got := c2.change(second.ID).Status; got != twin.StatusEffective {
+		t.Fatalf("排队变更确认后应生效，得到 %s", got)
+	}
+}
+
+// 核对每台设备最终目标与真实观察状态。
+func TestVerifyFinalTargetAndObservedState(t *testing.T) {
+	c, _, _ := newHarness(t)
+	ch := c.publish(map[string]twin.Config{"dev-1": {"temp": "21"}})
+	c.pull("dev-1")
+	v := c.verify("dev-1")
+	if v.Final || v.ObservedMatchesDesired || v.ConfirmedMatchesDesired {
+		t.Fatalf("未确认前核对不应通过，得到 %+v", v)
+	}
+	c.report("dev-1", twin.ReportRequest{Rev: ch.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "21"}})
+	v = c.verify("dev-1")
+	if !v.Final || !v.ObservedMatchesDesired || !v.ConfirmedMatchesDesired || v.DesiredConfig["temp"] != "21" {
+		t.Fatalf("确认后目标与观察应一致，得到 %+v", v)
+	}
+	// 新目标发布后，观察状态不再匹配最终目标。
+	c.setDesired("dev-1", twin.Config{"temp": "23"})
+	v = c.verify("dev-1")
+	if v.Final || v.ObservedMatchesDesired {
+		t.Fatalf("新目标未确认前核对不能通过，得到 %+v", v)
 	}
 }

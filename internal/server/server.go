@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -34,6 +35,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /devices/{id}/report", s.report)
 	mux.HandleFunc("POST /devices/{id}/offline", s.offline)
 	mux.HandleFunc("GET /devices/{id}/twin", s.getTwin)
+	mux.HandleFunc("GET /devices/{id}/verify", s.verifyDevice)
 	mux.HandleFunc("GET /devices/{id}/conflicts", s.listConflicts)
 	return mux
 }
@@ -77,23 +79,34 @@ func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
 
 type changeRequest struct {
 	Targets map[string]twin.Config `json:"targets"`
+	Mode    string                 `json:"mode"`
 }
 
-func decodeTargets(r *http.Request) (map[string]twin.Config, error) {
+func decodeChangeRequest(r *http.Request) (changeRequest, error) {
 	var req changeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return nil, err
+		return req, err
 	}
-	return req.Targets, nil
+	return req, nil
+}
+
+func parseMode(raw string) (twin.PublishMode, error) {
+	switch twin.PublishMode(raw) {
+	case "", twin.PublishModeSupersede:
+		return twin.PublishModeSupersede, nil
+	case twin.PublishModeQueue:
+		return twin.PublishModeQueue, nil
+	}
+	return "", fmt.Errorf("未知发布模式 %q，可选 queue 或 supersede", raw)
 }
 
 func (s *Server) previewChange(w http.ResponseWriter, r *http.Request) {
-	targets, err := decodeTargets(r)
+	req, err := decodeChangeRequest(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "请求必须是 {\"targets\":{\"设备ID\":{...}}} JSON: "+err.Error())
 		return
 	}
-	p, err := s.store.PreviewChange(targets, s.now())
+	p, err := s.store.PreviewChange(req.Targets, s.now())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -102,12 +115,17 @@ func (s *Server) previewChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishChange(w http.ResponseWriter, r *http.Request) {
-	targets, err := decodeTargets(r)
+	req, err := decodeChangeRequest(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "请求必须是 {\"targets\":{\"设备ID\":{...}}} JSON: "+err.Error())
 		return
 	}
-	ch, err := s.store.PublishChange(targets, twin.ChangeKindTarget, "", s.now())
+	mode, err := parseMode(req.Mode)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ch, err := s.store.PublishChange(req.Targets, twin.ChangeKindTarget, "", mode, s.now())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -210,6 +228,16 @@ func (s *Server) getTwin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v)
 }
 
+func (s *Server) verifyDevice(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	v, ok := s.store.Verify(id, s.now())
+	if !ok {
+		writeErr(w, http.StatusNotFound, "设备不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
 func (s *Server) listConflicts(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	includeResolved, _ := strconv.ParseBool(r.URL.Query().Get("resolved"))
@@ -229,6 +257,8 @@ func statusText(st twin.Status) string {
 		return "未生效，设备确认失败"
 	case twin.StatusSuperseded:
 		return "已被新目标替代，历史保留"
+	case twin.StatusQueued:
+		return "排队中，等待先前操作结束"
 	default:
 		return "待下发"
 	}

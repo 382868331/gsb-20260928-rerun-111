@@ -125,7 +125,7 @@ func (s *Store) addConflictLocked(deviceID string, reason ConflictReason, rev in
 
 // SetDesired 写入单设备目标，兼容旧接口；内部仍作为一个整体变更发布。
 func (s *Store) SetDesired(deviceID string, cfg Config, now time.Time) (*Device, int64, error) {
-	ch, err := s.PublishChange(map[string]Config{deviceID: cfg}, ChangeKindTarget, "", now)
+	ch, err := s.PublishChange(map[string]Config{deviceID: cfg}, ChangeKindTarget, "", PublishModeSupersede, now)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -168,6 +168,10 @@ func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Previe
 			ReportedRev:   d.ReportedRev,
 			CurrentStatus: d.Status(now),
 		}
+		if s.deviceBusyLocked(d, now) {
+			diff.WouldQueue = true
+			diff.BlockedByChangeID = d.DesiredChangeID
+		}
 		for k, v := range target {
 			old, ok := d.DesiredConfig[k]
 			if !ok {
@@ -187,14 +191,29 @@ func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Previe
 	return p, nil
 }
 
+// deviceBusyLocked 判断设备是否还有未结束的先前操作（已下发或待下发、尚未收到设备最终反馈）。
+// FAILED/PARTIAL 表示设备已给出最终反馈，先前操作已结束，不再视为占用。
+func (s *Store) deviceBusyLocked(d *Device, now time.Time) bool {
+	if d.DesiredRev == 0 || d.isDesiredConfirmedLocked() {
+		return false
+	}
+	st := d.Status(now)
+	return st == StatusPending || st == StatusDelivered
+}
+
 // PublishChange 发布一组相关配置。任一设备都只确认本设备目标，不能替变更中的其他设备背书。
-func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compensatesFor string, now time.Time) (*Change, error) {
+// mode 为 PublishModeQueue 时，仍有未结束操作的设备进入排队，等先前操作结束后才激活；
+// PublishModeSupersede 则显式取代当前目标，旧变更保留实际已确认部分与收尾状态。
+func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compensatesFor string, mode PublishMode, now time.Time) (*Change, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
 	targets, err := normalizeTargets(targets)
 	if err != nil {
 		return nil, err
+	}
+	if mode != PublishModeQueue && mode != PublishModeSupersede {
+		return nil, fmt.Errorf("未知发布模式 %q，可选 queue 或 supersede", mode)
 	}
 	if kind == ChangeKindCompensation {
 		if compensatesFor == "" {
@@ -221,10 +240,23 @@ func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compen
 
 	for id := range targets {
 		d := s.deviceLocked(id)
-		if active := s.currentChangeForDeviceLocked(id); active != nil {
-			s.supersedeChangeLocked(active, now)
-			ch.Supersedes = append(ch.Supersedes, active.ID)
+		if mode == PublishModeQueue && s.deviceBusyLocked(d, now) {
+			// 设备仍在等先前操作的反馈：只排队，不推进版本、不覆盖目标。
+			ch.DeviceResults[id] = ChangeDeviceResult{Status: StatusQueued, UpdatedAt: now}
+			d.QueuedChangeIDs = appendIfMissing(d.QueuedChangeIDs, ch.ID)
+			continue
 		}
+		if active := s.currentChangeForDeviceLocked(id); active != nil {
+			s.detachDeviceFromChangeLocked(active, id, ch.ID, now)
+			ch.Supersedes = appendIfMissing(ch.Supersedes, active.ID)
+		}
+		for _, queuedID := range d.QueuedChangeIDs {
+			if queued := s.changes[queuedID]; queued != nil && queued.ID != ch.ID {
+				s.detachDeviceFromChangeLocked(queued, id, ch.ID, now)
+				ch.Supersedes = appendIfMissing(ch.Supersedes, queued.ID)
+			}
+		}
+		d.QueuedChangeIDs = nil
 		if d.DesiredRev > 0 && d.DeliveredRev >= d.DesiredRev && !d.isDesiredConfirmedLocked() {
 			c := s.addConflictLocked(id, ReasonSuperseded, d.DesiredRev, d.DesiredConfig, now)
 			c.Open = false
@@ -238,10 +270,54 @@ func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compen
 	}
 	sort.Strings(ch.Supersedes)
 	s.changes[ch.ID] = ch
+	s.refreshChangeStatusLocked(ch, now)
 	if err := s.persistLocked(); err != nil {
 		return nil, err
 	}
 	return cloneChange(ch), nil
+}
+
+// promoteQueuedLocked 在设备先前操作结束后，按顺序激活队列中的下一个变更。
+func (s *Store) promoteQueuedLocked(deviceID string, now time.Time) {
+	d := s.devices[deviceID]
+	if d == nil {
+		return
+	}
+	for len(d.QueuedChangeIDs) > 0 && !s.deviceBusyLocked(d, now) {
+		chID := d.QueuedChangeIDs[0]
+		d.QueuedChangeIDs = d.QueuedChangeIDs[1:]
+		ch := s.changes[chID]
+		if ch == nil || ch.Status == StatusSuperseded {
+			continue
+		}
+		if active := s.currentChangeForDeviceLocked(deviceID); active != nil && active.ID != ch.ID {
+			s.detachDeviceFromChangeLocked(active, deviceID, ch.ID, now)
+			ch.Supersedes = appendIfMissing(ch.Supersedes, active.ID)
+			sort.Strings(ch.Supersedes)
+		}
+		d.DesiredRev++
+		d.DesiredConfig = cloneConfig(ch.Targets[deviceID])
+		d.DesiredChangeID = ch.ID
+		if ch.BaselineTargets == nil {
+			ch.BaselineTargets = map[string]Config{}
+		}
+		ch.BaselineTargets[deviceID] = cloneConfig(d.ConfirmedConfig)
+		result := ch.DeviceResults[deviceID]
+		result.DesiredRev = d.DesiredRev
+		result.Status = StatusPending
+		result.UpdatedAt = now
+		ch.DeviceResults[deviceID] = result
+		s.refreshChangeStatusLocked(ch, now)
+	}
+}
+
+func appendIfMissing(list []string, id string) []string {
+	for _, existing := range list {
+		if existing == id {
+			return list
+		}
+	}
+	return append(list, id)
 }
 
 // PublishCompensation 以各设备上一份精确确认状态作为默认补偿目标；也可显式给出补偿配置。
@@ -271,7 +347,7 @@ func (s *Store) PublishCompensation(changeID string, targets map[string]Config, 
 		targets[id] = cloneConfig(d.ConfirmedConfig)
 	}
 	s.mu.Unlock()
-	return s.PublishChange(targets, ChangeKindCompensation, changeID, now)
+	return s.PublishChange(targets, ChangeKindCompensation, changeID, PublishModeSupersede, now)
 }
 
 // Pull 是设备拉取最新目标。只标记为“已下发”，状态不会跳到“已生效”。
@@ -323,10 +399,13 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 
 	stale := req.Rev != d.DesiredRev
 	if stale {
-		c := s.addConflictLocked(deviceID, ReasonStale, req.Rev, map[string]string{
-			"reported_rev": fmt.Sprint(req.Rev),
-			"desired_rev":  fmt.Sprint(d.DesiredRev),
-		}, now)
+		var c *Conflict
+		if !s.hasOpenConflictLocked(deviceID, ReasonStale, req.Rev) {
+			c = s.addConflictLocked(deviceID, ReasonStale, req.Rev, map[string]string{
+				"reported_rev": fmt.Sprint(req.Rev),
+				"desired_rev":  fmt.Sprint(d.DesiredRev),
+			}, now)
+		}
 		s.recordReportOnChangeLocked(deviceID, req, StatusPending, true, now)
 		if err := s.persistLocked(); err != nil {
 			return nil, nil, false, err
@@ -350,20 +429,36 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 	} else {
 		if len(req.Rejected) > 0 {
 			deviceStatus = StatusPartial
-			conflict = s.addConflictLocked(deviceID, ReasonRejected, req.Rev, cloneConfig(req.Rejected), now)
+			if !s.hasOpenConflictLocked(deviceID, ReasonRejected, req.Rev) {
+				conflict = s.addConflictLocked(deviceID, ReasonRejected, req.Rev, cloneConfig(req.Rejected), now)
+			}
 		} else {
-			conflict = s.addConflictLocked(deviceID, ReasonMismatch, req.Rev, map[string]string{
-				"applied": fmt.Sprint(cloneConfig(req.Applied)),
-				"desired": fmt.Sprint(cloneConfig(d.DesiredConfig)),
-			}, now)
+			if !s.hasOpenConflictLocked(deviceID, ReasonMismatch, req.Rev) {
+				conflict = s.addConflictLocked(deviceID, ReasonMismatch, req.Rev, map[string]string{
+					"applied": fmt.Sprint(cloneConfig(req.Applied)),
+					"desired": fmt.Sprint(cloneConfig(d.DesiredConfig)),
+				}, now)
+			}
 		}
 	}
 	s.recordReportOnChangeLocked(deviceID, req, deviceStatus, false, now)
+	// 设备已给出最终反馈（生效或失败）后，先前操作结束，排队的变更可以激活。
+	s.promoteQueuedLocked(deviceID, now)
 
 	if err := s.persistLocked(); err != nil {
 		return nil, nil, false, err
 	}
 	return d, conflict, false, nil
+}
+
+// hasOpenConflictLocked 避免重复确认/重复上报刷出多条相同的未解决冲突。
+func (s *Store) hasOpenConflictLocked(deviceID string, reason ConflictReason, rev int64) bool {
+	for _, c := range s.conflicts {
+		if c.DeviceID == deviceID && c.Open && c.Reason == reason && c.Rev == rev {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) resolveOpenLocked(deviceID string, reason ConflictReason, rev int64, now time.Time) {
@@ -410,7 +505,33 @@ func (s *Store) viewLocked(d *Device, now time.Time) *TwinView {
 		ReportedRejected: cloneConfig(d.ReportedRejected),
 		ConfirmedRev:     d.ConfirmedRev,
 		ConfirmedConfig:  cloneConfig(d.ConfirmedConfig),
+		AwaitingFeedback: s.deviceBusyLocked(d, now),
+		QueuedChanges:    append([]string(nil), d.QueuedChangeIDs...),
 	}
+}
+
+// Verify 核对设备的最终目标与真实观察状态：期望、上报、确认三者是否一致。
+func (s *Store) Verify(deviceID string, now time.Time) (*VerifyView, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.devices[deviceID]
+	if !ok {
+		return nil, false
+	}
+	v := &VerifyView{
+		DeviceID:                d.ID,
+		DesiredRev:              d.DesiredRev,
+		DesiredConfig:           cloneConfig(d.DesiredConfig),
+		ReportedRev:             d.ReportedRev,
+		ReportedConfig:          cloneConfig(d.ReportedConfig),
+		ConfirmedRev:            d.ConfirmedRev,
+		ConfirmedConfig:         cloneConfig(d.ConfirmedConfig),
+		QueuedChanges:           append([]string(nil), d.QueuedChangeIDs...),
+		ObservedMatchesDesired:  d.ReportedRev == d.DesiredRev && d.DesiredRev > 0 && configEqual(d.ReportedConfig, d.DesiredConfig) && len(d.ReportedRejected) == 0,
+		ConfirmedMatchesDesired: d.isDesiredConfirmedLocked(),
+	}
+	v.Final = v.ConfirmedMatchesDesired && v.ObservedMatchesDesired
+	return v, true
 }
 
 func (s *Store) ListViews(now time.Time) []*TwinView {
@@ -508,23 +629,90 @@ func (s *Store) currentChangeForDeviceLocked(deviceID string) *Change {
 }
 
 func isActiveChangeStatus(st Status) bool {
-	return st == StatusPending || st == StatusDelivered || st == StatusPartial || st == StatusFailed
+	return st == StatusPending || st == StatusDelivered || st == StatusPartial || st == StatusFailed || st == StatusQueued
 }
 
-func (s *Store) supersedeChangeLocked(ch *Change, now time.Time) {
-	changed := ch.Status != StatusSuperseded
+// detachDeviceFromChangeLocked 把一台设备从变更中摘下：已确认结果保留，
+// 其余结果记 SUPERSEDED 并把真实收尾状态留在 PriorStatus。
+// 只要组内还有设备依赖该变更（未结束操作或排队），变更就保持活跃，
+// 不能因为一台设备有了新目标就掩盖其他设备尚未完成的反馈。
+func (s *Store) detachDeviceFromChangeLocked(ch *Change, deviceID, byID string, now time.Time) {
+	if ch.Status == StatusSuperseded {
+		return
+	}
+	if result, ok := ch.DeviceResults[deviceID]; ok && result.Status != StatusEffective && result.Status != StatusSuperseded {
+		if result.PriorStatus == "" {
+			result.PriorStatus = result.Status
+		}
+		result.Status = StatusSuperseded
+		result.UpdatedAt = now
+		ch.DeviceResults[deviceID] = result
+	}
+	s.maybeCloseChangeLocked(ch, deviceID, byID, now)
+}
+
+// maybeCloseChangeLocked 在没有任何设备再依赖该变更时收尾：
+// 全部确认过的保持生效记录，否则整体标记 SUPERSEDED 并保留收尾说明。
+func (s *Store) maybeCloseChangeLocked(ch *Change, exceptDevice, byID string, now time.Time) {
+	if ch.Status == StatusSuperseded {
+		return
+	}
 	for id, result := range ch.DeviceResults {
-		if result.Status != StatusEffective {
+		if id == exceptDevice {
+			continue
+		}
+		if result.Status == StatusQueued {
+			return
+		}
+		if d := s.devices[id]; d != nil && d.DesiredChangeID == ch.ID && s.deviceBusyLocked(d, now) {
+			return
+		}
+	}
+	s.refreshChangeStatusLocked(ch, now)
+	s.supersedeChangeLocked(ch, byID, now)
+}
+
+// supersedeChangeLocked 把变更标记为已替代：已确认生效的设备结果原样保留，
+// 其余结果的收尾状态记入 PriorStatus，并留下收尾说明，不能改写成失败或抹掉。
+func (s *Store) supersedeChangeLocked(ch *Change, byID string, now time.Time) {
+	if ch.Status == StatusSuperseded {
+		return
+	}
+	confirmed := 0
+	for id, result := range ch.DeviceResults {
+		if result.Status == StatusEffective {
+			confirmed++
+			continue
+		}
+		if result.PriorStatus == "" {
+			result.PriorStatus = result.Status
+		}
+		if result.Status != StatusSuperseded {
 			result.Status = StatusSuperseded
 			result.UpdatedAt = now
 			ch.DeviceResults[id] = result
-			changed = true
 		}
 	}
 	ch.Status = StatusSuperseded
-	if changed || ch.SupersededAt == nil {
+	ch.SupersededBy = byID
+	if ch.SupersededAt == nil {
 		ch.SupersededAt = &now
 	}
+	ch.ClosureNote = fmt.Sprintf("被 %s 取代：%d/%d 设备已确认生效，其余设备的收尾状态保留在 prior_status", byID, confirmed, len(ch.DeviceResults))
+	// 被取代的变更不得继续占用任何设备的排队队列。
+	for _, d := range s.devices {
+		d.QueuedChangeIDs = removeChangeID(d.QueuedChangeIDs, ch.ID)
+	}
+}
+
+func removeChangeID(list []string, id string) []string {
+	out := list[:0]
+	for _, existing := range list {
+		if existing != id {
+			out = append(out, existing)
+		}
+	}
+	return out
 }
 
 func (s *Store) recordReportOnChangeLocked(deviceID string, req ReportRequest, resultStatus Status, stale bool, now time.Time) {
@@ -589,8 +777,10 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 		ch.Status = StatusFailed
 	case hasStatus(StatusDelivered):
 		ch.Status = StatusDelivered
-	default:
+	case hasStatus(StatusPending):
 		ch.Status = StatusPending
+	default:
+		ch.Status = StatusQueued
 	}
 }
 
@@ -644,6 +834,8 @@ func statusText(st Status) string {
 		return "未生效，设备确认失败"
 	case StatusSuperseded:
 		return "已被新目标替代，历史保留"
+	case StatusQueued:
+		return "排队中，等待先前操作结束"
 	default:
 		return "待下发"
 	}

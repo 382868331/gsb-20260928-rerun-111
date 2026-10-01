@@ -18,6 +18,7 @@
 | `EFFECTIVE` 已生效 | 设备按当前期望版本全部确认 |
 | `FAILED` 未生效 | 设备上报与期望不一致，等待新目标或补偿目标 |
 | `SUPERSEDED` 已替代 | 旧目标被新目标替代，只作为历史保留 |
+| `QUEUED` 排队中 | 变更已受理，但设备还有未结束的先前操作，等其完成后才激活 |
 
 ## 关键一致性规则
 
@@ -27,6 +28,11 @@
 - **部分拒绝/失败**：上报里带 `rejected` 键值时状态为 `PARTIAL` 并记录 `REJECTED` 冲突；非精确且未列拒绝时记录 `APPLIED_MISMATCH`。部分接受不会推进该设备的 `confirmed_rev`。
 - **发布前预演**：`POST /changes/preview` 返回每台设备的新增、更新、删除项以及当前期望/观察/确认版本；不创建设备、不推进版本、不落盘。
 - **失败补偿**：`POST /changes/{id}/compensate` 创建 `COMPENSATION` 新目标。空目标默认回到原变更发布前每台设备的已确认基线；补偿仍需拉取和设备确认。
+- **变更排队与显式取代**：`POST /changes` 接受 `"mode":"queue"` 或 `"mode":"supersede"`（默认）。排队模式下，仍有未结束操作（待下发/已下发未确认）的设备只把变更挂入本机队列，不推进版本、不覆盖目标；空闲设备立即继续。先前操作结束（确认生效或设备给出最终反馈）后，队首变更自动激活。显式取代立即切换目标。
+- **排队可见**：孪生视图带 `awaiting_feedback` 与 `queued_changes`，预演差异带 `would_queue`/`blocked_by_change_id`，可直接看出哪些设备能继续、哪些必须等待先前操作结束。
+- **被取代变更的收尾**：一台设备切换到新目标时，只把该设备从旧变更中摘下；只要组内其他设备还没结束，旧变更保持活跃，迟到确认仍计入。没有任何设备依赖后才整体收尾为 `SUPERSEDED`：已确认生效的设备结果原样保留，其余结果的收尾状态留在 `prior_status`，变更上记录 `superseded_by` 与 `closure_note`。
+- **重复确认幂等**：同一版本的重复上报（精确确认或拒绝）不重复产生冲突、不改变已生效结果与生效时间。
+- **目标核对**：`GET /devices/{id}/verify` 对比最终目标与真实观察状态，输出 `observed_matches_desired`、`confirmed_matches_desired` 与 `final`。
 - **重启保留**：所有状态原子写入 JSON 文件（临时文件 + rename），服务重启后未完成的变更仍是 `PENDING`/`DELIVERED`，设备可继续完成。
 - **替代记录保留**：离线多改或补偿发布后，旧变更标记 `SUPERSEDED`；已经成功的设备结果仍保留在该历史变更中，不会被改写成失败。
 - **冲突可查询**：`GET /devices/{id}/conflicts` 只看未解决冲突，`?all=true` 包含历史；被替代记录默认是历史，不占用未解决列表。
@@ -42,6 +48,7 @@
 | `GET /changes/{id}` | 查询一个变更组的逐设备结果 |
 | `POST /changes/{id}/compensate` | 基于失败变更发布补偿目标 |
 | `GET /devices/{id}/twin` | 单设备三态视图与中文状态 |
+| `GET /devices/{id}/verify` | 核对最终目标与真实观察状态是否一致 |
 | `PUT /devices/{id}/desired` | 下发整份期望配置（JSON 对象），返回新版本号 |
 | `POST /devices/{id}/pull` | 设备拉取期望；有新版本时返回 `changed=true`，只标记已下发 |
 | `POST /devices/{id}/report` | 设备上报 `{rev, applied, rejected}`；迟到上报返回 `stale=true` |
