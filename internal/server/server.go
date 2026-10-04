@@ -21,6 +21,11 @@ func New(store *twin.Store) *Server {
 	return &Server{store: store, now: time.Now}
 }
 
+// SetClock 替换服务时钟，测试可用虚拟时间推进预约的生效与到期。
+func (s *Server) SetClock(now func() time.Time) {
+	s.now = now
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /devices", s.listDevices)
@@ -29,6 +34,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /changes", s.listChanges)
 	mux.HandleFunc("GET /changes/{id}", s.getChange)
 	mux.HandleFunc("POST /changes/{id}/compensate", s.compensateChange)
+	mux.HandleFunc("POST /reservations", s.createReservation)
+	mux.HandleFunc("GET /reservations", s.listReservations)
+	mux.HandleFunc("GET /reservations/{id}", s.getReservation)
+	mux.HandleFunc("PATCH /reservations/{id}", s.shortenReservation)
+	mux.HandleFunc("POST /reservations/{id}/cancel", s.cancelReservationDevices)
 	mux.HandleFunc("PUT /devices/{id}/desired", s.setDesired)
 	mux.HandleFunc("POST /devices/{id}/pull", s.pull)
 	mux.HandleFunc("POST /devices/{id}/report", s.report)
@@ -121,7 +131,7 @@ func (s *Server) publishChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
-	ch, ok := s.store.Change(r.PathValue("id"))
+	ch, ok := s.store.Change(r.PathValue("id"), s.now())
 	if !ok {
 		writeErr(w, http.StatusNotFound, "变更不存在")
 		return
@@ -130,7 +140,76 @@ func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listChanges(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"changes": s.store.ListChanges()})
+	writeJSON(w, http.StatusOK, map[string]any{"changes": s.store.ListChanges(s.now())})
+}
+
+type reservationRequest struct {
+	Targets map[string]twin.Config `json:"targets"`
+	StartAt time.Time              `json:"start_at"`
+	EndAt   time.Time              `json:"end_at"`
+}
+
+func (s *Server) createReservation(w http.ResponseWriter, r *http.Request) {
+	var req reservationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "预约请求必须是 {\"targets\":{...},\"start_at\":...,\"end_at\":...} JSON: "+err.Error())
+		return
+	}
+	if req.StartAt.IsZero() || req.EndAt.IsZero() {
+		writeErr(w, http.StatusBadRequest, "预约必须包含 start_at 与 end_at")
+		return
+	}
+	view, err := s.store.CreateReservation(req.Targets, req.StartAt, req.EndAt, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, view)
+}
+
+func (s *Server) getReservation(w http.ResponseWriter, r *http.Request) {
+	view, ok := s.store.Reservation(r.PathValue("id"), s.now())
+	if !ok {
+		writeErr(w, http.StatusNotFound, "预约不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) listReservations(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"reservations": s.store.ListReservations(s.now())})
+}
+
+func (s *Server) shortenReservation(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		EndAt time.Time `json:"end_at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.EndAt.IsZero() {
+		writeErr(w, http.StatusBadRequest, "请求必须包含新的 end_at")
+		return
+	}
+	view, err := s.store.ShortenReservation(r.PathValue("id"), req.EndAt, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) cancelReservationDevices(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Devices []string `json:"devices"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求必须是 {\"devices\":[...]} JSON: "+err.Error())
+		return
+	}
+	view, err := s.store.CancelReservationDevices(r.PathValue("id"), req.Devices, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func (s *Server) compensateChange(w http.ResponseWriter, r *http.Request) {

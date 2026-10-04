@@ -11,35 +11,44 @@ import (
 )
 
 type Store struct {
-	mu          sync.Mutex
-	path        string
-	devices     map[string]*Device
-	conflicts   map[string]*Conflict
-	conflictSeq int64
-	changes     map[string]*Change
-	changeSeq   int64
+	mu             sync.Mutex
+	path           string
+	devices        map[string]*Device
+	conflicts      map[string]*Conflict
+	conflictSeq    int64
+	changes        map[string]*Change
+	changeSeq      int64
+	layers         map[string][]configLayer
+	reservations   map[string]*Reservation
+	reservationSeq int64
 }
 
 type snapshot struct {
-	Devices     []*Device   `json:"devices"`
-	Conflicts   []*Conflict `json:"conflicts"`
-	ConflictSeq int64       `json:"conflict_seq"`
-	Changes     []*Change   `json:"changes"`
-	ChangeSeq   int64       `json:"change_seq"`
+	Devices        []*Device                `json:"devices"`
+	Conflicts      []*Conflict              `json:"conflicts"`
+	ConflictSeq    int64                    `json:"conflict_seq"`
+	Changes        []*Change                `json:"changes"`
+	ChangeSeq      int64                    `json:"change_seq"`
+	Layers         map[string][]configLayer `json:"layers,omitempty"`
+	Reservations   []*Reservation           `json:"reservations,omitempty"`
+	ReservationSeq int64                    `json:"reservation_seq,omitempty"`
 }
 
 type PublishOptions struct {
 	Kind           ChangeKind
 	CompensatesFor string
 	Strategy       ChangeStrategy
+	ReservationID  string
 }
 
 func NewStore(path string) (*Store, error) {
 	s := &Store{
-		path:      path,
-		devices:   map[string]*Device{},
-		conflicts: map[string]*Conflict{},
-		changes:   map[string]*Change{},
+		path:         path,
+		devices:      map[string]*Device{},
+		conflicts:    map[string]*Conflict{},
+		changes:      map[string]*Change{},
+		layers:       map[string][]configLayer{},
+		reservations: map[string]*Reservation{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -70,6 +79,13 @@ func (s *Store) load() error {
 		s.changes[ch.ID] = ch
 	}
 	s.changeSeq = snap.ChangeSeq
+	for id, ls := range snap.Layers {
+		s.layers[id] = ls
+	}
+	for _, r := range snap.Reservations {
+		s.reservations[r.ID] = r
+	}
+	s.reservationSeq = snap.ReservationSeq
 	return nil
 }
 
@@ -90,6 +106,12 @@ func (s *Store) persistLocked() error {
 		snap.Changes = append(snap.Changes, ch)
 	}
 	sort.Slice(snap.Changes, func(i, j int) bool { return snap.Changes[i].ID < snap.Changes[j].ID })
+	snap.Layers = s.layers
+	for _, r := range s.reservations {
+		snap.Reservations = append(snap.Reservations, r)
+	}
+	sort.Slice(snap.Reservations, func(i, j int) bool { return snap.Reservations[i].ID < snap.Reservations[j].ID })
+	snap.ReservationSeq = s.reservationSeq
 
 	data, err := json.MarshalIndent(&snap, "", "  ")
 	if err != nil {
@@ -149,6 +171,7 @@ func (s *Store) SetDesired(deviceID string, cfg Config, now time.Time) (*Device,
 func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Preview, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	now = now.UTC()
 	targets, err := normalizeTargets(targets)
 	if err != nil {
@@ -209,6 +232,19 @@ func (s *Store) PublishChange(targets map[string]Config, kind ChangeKind, compen
 func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts PublishOptions, now time.Time) (*Change, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
+	ch, err := s.publishChangeLocked(targets, opts, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return ch, nil
+}
+
+// publishChangeLocked 是发布变更的内部实现，调用前必须持锁并已完成时间同步。
+func (s *Store) publishChangeLocked(targets map[string]Config, opts PublishOptions, now time.Time) (*Change, error) {
 	now = now.UTC()
 	targets, err := normalizeTargets(targets)
 	if err != nil {
@@ -246,6 +282,7 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 		ReadyDevices:    []string{},
 		WaitingDevices:  []string{},
 		CreatedAt:       now,
+		ReservationID:   opts.ReservationID,
 	}
 	if kind == ChangeKindCompensation {
 		ch.CompensatesFor = opts.CompensatesFor
@@ -286,6 +323,9 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 			c.ResolvedAt = &now
 		}
 		s.assignTargetToDeviceLocked(ch, id, targets[id], d, now)
+		if kind == ChangeKindTarget || kind == ChangeKindCompensation {
+			s.setBaseLayerLocked(id, ch.ID, targets[id])
+		}
 		if previousID != "" && previousID != ch.ID {
 			if previous := s.changes[previousID]; previous != nil {
 				s.supersedeDeviceInChangeLocked(previous, id, now)
@@ -297,9 +337,6 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 	sort.Strings(ch.Supersedes)
 	s.refreshChangeStatusLocked(ch, now)
 	s.changes[ch.ID] = ch
-	if err := s.persistLocked(); err != nil {
-		return nil, err
-	}
 	return cloneChange(ch), nil
 }
 
@@ -337,6 +374,7 @@ func (s *Store) PublishCompensation(changeID string, targets map[string]Config, 
 func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	d := s.deviceLocked(deviceID)
 	d.Online = true
 	changed := d.DesiredRev > d.DeliveredRev
@@ -367,6 +405,7 @@ func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Device, *Conflict, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	d := s.deviceLocked(deviceID)
 	d.Online = true
 	now = now.UTC()
@@ -450,6 +489,7 @@ func (s *Store) MarkOffline(deviceID string) error {
 func (s *Store) View(deviceID string, now time.Time) (*TwinView, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	d, ok := s.devices[deviceID]
 	if !ok {
 		return nil, false
@@ -479,6 +519,7 @@ func (s *Store) viewLocked(d *Device, now time.Time) *TwinView {
 func (s *Store) ListViews(now time.Time) []*TwinView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	ids := make([]string, 0, len(s.devices))
 	for id := range s.devices {
 		ids = append(ids, id)
@@ -509,9 +550,10 @@ func (s *Store) Conflicts(deviceID string, includeResolved bool) []*Conflict {
 	return out
 }
 
-func (s *Store) Change(changeID string) (*ChangeView, bool) {
+func (s *Store) Change(changeID string, now time.Time) (*ChangeView, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	ch, ok := s.changes[changeID]
 	if !ok {
 		return nil, false
@@ -520,9 +562,10 @@ func (s *Store) Change(changeID string) (*ChangeView, bool) {
 	return &v, true
 }
 
-func (s *Store) ListChanges() []*ChangeView {
+func (s *Store) ListChanges(now time.Time) []*ChangeView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncLocked(now)
 	ids := make([]string, 0, len(s.changes))
 	for id := range s.changes {
 		ids = append(ids, id)
@@ -627,6 +670,9 @@ func (s *Store) activateNextQueuedForDeviceLocked(deviceID string, now time.Time
 	next.DeviceResults[deviceID] = result
 	next.WaitingDevices = removeString(next.WaitingDevices, deviceID)
 	next.ReadyDevices = appendUnique(next.ReadyDevices, deviceID)
+	if next.Kind == ChangeKindTarget || next.Kind == ChangeKindCompensation {
+		s.setBaseLayerLocked(deviceID, next.ID, next.Targets[deviceID])
+	}
 	s.refreshChangeStatusLocked(next, now)
 }
 

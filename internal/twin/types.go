@@ -30,6 +30,10 @@ type ChangeKind string
 const (
 	ChangeKindTarget       ChangeKind = "TARGET"
 	ChangeKindCompensation ChangeKind = "COMPENSATION"
+	// ChangeKindReservation 预约到点时发布的生效变更。
+	ChangeKindReservation ChangeKind = "RESERVATION"
+	// ChangeKindRestore 预约到期或取消后发布的恢复变更。
+	ChangeKindRestore ChangeKind = "RESTORE"
 )
 
 type ChangeStrategy string
@@ -56,9 +60,81 @@ type Change struct {
 	WaitingDevices  []string                      `json:"waiting_devices,omitempty"`
 	Supersedes      []string                      `json:"supersedes,omitempty"`
 	CompensatesFor  string                        `json:"compensates_for,omitempty"`
+	ReservationID   string                        `json:"reservation_id,omitempty"`
 	CreatedAt       time.Time                     `json:"created_at"`
 	EffectiveAt     *time.Time                    `json:"effective_at,omitempty"`
 	SupersededAt    *time.Time                    `json:"superseded_at,omitempty"`
+}
+
+// Reservation 是一次带有效期的预约变更：StartAt 起生效，EndAt 到期后恢复到当时仍有效的目标。
+type Reservation struct {
+	ID               string            `json:"id"`
+	Targets          map[string]Config `json:"targets"`
+	StartAt          time.Time         `json:"start_at"`
+	EndAt            time.Time         `json:"end_at"`
+	ActivateChangeID string            `json:"activate_change_id,omitempty"`
+	// RestoreChangeIDs 记录每台设备的收尾恢复变更；键存在即表示已安排收尾，空值表示无需变更。
+	RestoreChangeIDs map[string]string `json:"restore_change_ids,omitempty"`
+	CancelledDevices map[string]bool   `json:"cancelled_devices,omitempty"`
+	Expired          bool              `json:"expired"`
+	CreatedAt        time.Time         `json:"created_at"`
+}
+
+// ReservationPhase 是单台设备在一次预约中的进度，严格区分“应当生效”与“已经确认生效”。
+type ReservationPhase string
+
+const (
+	// PhaseWaitingStart 未到预约开始时间。
+	PhaseWaitingStart ReservationPhase = "WAITING_START"
+	// PhaseDue 开始时间已到，预约目标应当生效，但设备尚未确认。
+	PhaseDue ReservationPhase = "DUE"
+	// PhaseConfirmed 设备已精确确认预约目标生效。
+	PhaseConfirmed ReservationPhase = "CONFIRMED"
+	// PhaseRestoreDue 预约已到期/被取消，恢复目标已安排，仍等待设备核实。
+	PhaseRestoreDue ReservationPhase = "RESTORE_DUE"
+	// PhaseRestored 设备已确认恢复到当时仍有效的目标。
+	PhaseRestored ReservationPhase = "RESTORED"
+	// PhaseCancelled 设备被操作者取消，无需收尾。
+	PhaseCancelled ReservationPhase = "CANCELLED"
+	// PhaseSkipped 预约在生效前就已到期，从未执行。
+	PhaseSkipped ReservationPhase = "SKIPPED"
+)
+
+type ReservationStatus string
+
+const (
+	ReservationScheduled ReservationStatus = "SCHEDULED"
+	ReservationActive    ReservationStatus = "ACTIVE"
+	ReservationRestoring ReservationStatus = "RESTORING"
+	ReservationCompleted ReservationStatus = "COMPLETED"
+	ReservationCancelled ReservationStatus = "CANCELLED"
+)
+
+// ReservationDeviceView 说明一台设备在预约中的进度与等待原因。
+type ReservationDeviceView struct {
+	DeviceID         string           `json:"device_id"`
+	Online           bool             `json:"online"`
+	Phase            ReservationPhase `json:"phase"`
+	PhaseText        string           `json:"phase_text"`
+	WaitReason       string           `json:"wait_reason,omitempty"`
+	ActivateChangeID string           `json:"activate_change_id,omitempty"`
+	RestoreChangeID  string           `json:"restore_change_id,omitempty"`
+}
+
+// ReservationView 是预约的对外视图，整体状态由逐设备进度推导。
+type ReservationView struct {
+	*Reservation
+	Status     ReservationStatus       `json:"status"`
+	StatusText string                  `json:"status_text"`
+	Devices    []ReservationDeviceView `json:"devices"`
+}
+
+// configLayer 是设备上的一层有效配置来源：底层是普通变更，上层按激活顺序叠放预约。
+// 预约到期时移除本层，剩余最上层即为“当时仍然有效的目标”。
+type configLayer struct {
+	ChangeID      string `json:"change_id"`
+	ReservationID string `json:"reservation_id,omitempty"`
+	Config        Config `json:"config"`
 }
 
 type ChangeDeviceResult struct {
