@@ -18,7 +18,7 @@ type Server struct {
 }
 
 func New(store *twin.Store) *Server {
-	return &Server{store: store, now: time.Now}
+	return &Server{store: store, now: store.Now}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -29,6 +29,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /changes", s.listChanges)
 	mux.HandleFunc("GET /changes/{id}", s.getChange)
 	mux.HandleFunc("POST /changes/{id}/compensate", s.compensateChange)
+	mux.HandleFunc("POST /changes/{id}/cancel", s.cancelChange)
+	mux.HandleFunc("POST /changes/{id}/shorten", s.shortenChange)
+	mux.HandleFunc("POST /clock", s.setClock)
+	mux.HandleFunc("GET /clock", s.getClock)
+	mux.HandleFunc("POST /clock/advance", s.setClock)
+	mux.HandleFunc("POST /virtual-time/advance", s.setClock)
+	mux.HandleFunc("POST /time/advance", s.setClock)
 	mux.HandleFunc("PUT /devices/{id}/desired", s.setDesired)
 	mux.HandleFunc("POST /devices/{id}/pull", s.pull)
 	mux.HandleFunc("POST /devices/{id}/report", s.report)
@@ -78,6 +85,8 @@ func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
 type changeRequest struct {
 	Targets  map[string]twin.Config `json:"targets"`
 	Strategy twin.ChangeStrategy    `json:"strategy"`
+	StartAt  *time.Time             `json:"start_at"`
+	EndAt    *time.Time             `json:"end_at"`
 }
 
 func decodeTargets(r *http.Request) (map[string]twin.Config, error) {
@@ -112,12 +121,76 @@ func (s *Server) publishChange(w http.ResponseWriter, r *http.Request) {
 	ch, err := s.store.PublishChangeWithOptions(targets, twin.PublishOptions{
 		Kind:     twin.ChangeKindTarget,
 		Strategy: req.Strategy,
+		StartAt:  req.StartAt,
+		EndAt:    req.EndAt,
 	}, s.now())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusAccepted, ch)
+}
+
+type reservationDevicesRequest struct {
+	Devices []string `json:"devices"`
+}
+
+type shortenRequest struct {
+	EndAt   time.Time `json:"end_at"`
+	Devices []string  `json:"devices"`
+}
+
+func (s *Server) cancelChange(w http.ResponseWriter, r *http.Request) {
+	req := reservationDevicesRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "取消请求必须是 JSON 对象: "+err.Error())
+		return
+	}
+	ch, err := s.store.CancelReservation(r.PathValue("id"), req.Devices, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ch)
+}
+
+func (s *Server) shortenChange(w http.ResponseWriter, r *http.Request) {
+	req := shortenRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "缩短请求必须包含 end_at: "+err.Error())
+		return
+	}
+	ch, err := s.store.ShortenReservation(r.PathValue("id"), req.EndAt, req.Devices, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ch)
+}
+
+type clockRequest struct {
+	Now time.Time `json:"now"`
+}
+
+func (s *Server) setClock(w http.ResponseWriter, r *http.Request) {
+	req := clockRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "时钟请求必须是 {\"now\":\"RFC3339\"}: "+err.Error())
+		return
+	}
+	if req.Now.IsZero() {
+		writeErr(w, http.StatusBadRequest, "now 不能为空")
+		return
+	}
+	if err := s.store.SetVirtualClock(req.Now); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"now": s.store.Now()})
+}
+
+func (s *Server) getClock(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"now": s.store.Now()})
 }
 
 func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
@@ -236,6 +309,12 @@ func statusText(st twin.Status) string {
 		return "已被新目标替代，历史保留"
 	case twin.StatusQueued:
 		return "等待先前设备操作结束"
+	case twin.StatusScheduled:
+		return "预约等待生效时间"
+	case twin.StatusExpired:
+		return "预约有效期已结束，等待恢复收尾确认"
+	case twin.StatusCancelled:
+		return "预约已取消"
 	default:
 		return "待下发"
 	}

@@ -18,6 +18,7 @@ type Store struct {
 	conflictSeq int64
 	changes     map[string]*Change
 	changeSeq   int64
+	clock       *time.Time
 }
 
 type snapshot struct {
@@ -26,12 +27,15 @@ type snapshot struct {
 	ConflictSeq int64       `json:"conflict_seq"`
 	Changes     []*Change   `json:"changes"`
 	ChangeSeq   int64       `json:"change_seq"`
+	Clock       *time.Time  `json:"clock,omitempty"`
 }
 
 type PublishOptions struct {
 	Kind           ChangeKind
 	CompensatesFor string
 	Strategy       ChangeStrategy
+	StartAt        *time.Time
+	EndAt          *time.Time
 }
 
 func NewStore(path string) (*Store, error) {
@@ -70,6 +74,7 @@ func (s *Store) load() error {
 		s.changes[ch.ID] = ch
 	}
 	s.changeSeq = snap.ChangeSeq
+	s.clock = snap.Clock
 	return nil
 }
 
@@ -86,6 +91,7 @@ func (s *Store) persistLocked() error {
 	sort.Slice(snap.Conflicts, func(i, j int) bool { return snap.Conflicts[i].ID < snap.Conflicts[j].ID })
 	snap.ConflictSeq = s.conflictSeq
 	snap.ChangeSeq = s.changeSeq
+	snap.Clock = s.clock
 	for _, ch := range s.changes {
 		snap.Changes = append(snap.Changes, ch)
 	}
@@ -145,11 +151,446 @@ func (s *Store) SetDesired(deviceID string, cfg Config, now time.Time) (*Device,
 	return d, rev, nil
 }
 
+func (s *Store) Now() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.clock != nil {
+		return *s.clock
+	}
+	return time.Now().UTC()
+}
+
+func (s *Store) nowLocked() time.Time {
+	if s.clock != nil {
+		return *s.clock
+	}
+	return time.Now().UTC()
+}
+
+func (s *Store) SetVirtualClock(t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := t.UTC()
+	s.clock = &now
+	if err := s.processDueLocked(now); err != nil {
+		return err
+	}
+	return s.persistLocked()
+}
+
+func (s *Store) ClearVirtualClock() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clock = nil
+	return s.persistLocked()
+}
+
+func (s *Store) CancelReservation(changeID string, devices []string, now time.Time) (*Change, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now = now.UTC()
+	if err := s.processDueLocked(now); err != nil {
+		return nil, err
+	}
+	ch, ok := s.changes[changeID]
+	if !ok {
+		return nil, fmt.Errorf("变更 %s 不存在", changeID)
+	}
+	if ch.StartAt == nil {
+		return nil, fmt.Errorf("变更 %s 不是预约", changeID)
+	}
+	targets := deviceSet(devices, ch.Targets)
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("没有可操作的预约设备")
+	}
+	cancelled := now
+	for id := range targets {
+		result := ch.DeviceResults[id]
+		switch result.Status {
+		case StatusScheduled:
+			result.Status = StatusCancelled
+			result.DispatchState = "CANCELLED"
+			result.EndReason = "CANCELLED"
+			result.WaitReason = ""
+			result.EndAt = &cancelled
+			result.UpdatedAt = now
+			ch.DeviceResults[id] = result
+			delete(ch.DeviceEndsAt, id)
+		case StatusPending, StatusDelivered, StatusEffective, StatusPartial, StatusFailed:
+			if err := s.finishReservationDeviceLocked(ch, id, now, "CANCELLED"); err != nil {
+				return nil, err
+			}
+			result = ch.DeviceResults[id]
+			result.EndReason = "CANCELLED"
+			ch.DeviceResults[id] = result
+			delete(ch.DeviceEndsAt, id)
+		default:
+			return nil, fmt.Errorf("设备 %s 的预约已结束，不能取消", id)
+		}
+	}
+	if allDeviceResults(ch, StatusCancelled) {
+		ch.CancelledAt = &cancelled
+	}
+	s.refreshChangeStatusLocked(ch, now)
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return cloneChange(ch), nil
+}
+
+func (s *Store) ShortenReservation(changeID string, endAt time.Time, devices []string, now time.Time) (*Change, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now = now.UTC()
+	endAt = endAt.UTC()
+	if err := s.processDueLocked(now); err != nil {
+		return nil, err
+	}
+	ch, ok := s.changes[changeID]
+	if !ok || ch.StartAt == nil {
+		return nil, fmt.Errorf("预约 %s 不存在", changeID)
+	}
+	if !endAt.After(now) {
+		return nil, fmt.Errorf("新的有效期必须晚于当前时间")
+	}
+	targets := deviceSet(devices, ch.Targets)
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("没有可缩短的预约设备")
+	}
+	for id := range targets {
+		result := ch.DeviceResults[id]
+		if result.EndAt == nil {
+			return nil, fmt.Errorf("设备 %s 的预约没有有效期", id)
+		}
+		if !endAt.Before(*result.EndAt) {
+			return nil, fmt.Errorf("只能缩短，不能延长设备 %s 的有效期", id)
+		}
+		result.EndAt = &endAt
+		result.UpdatedAt = now
+		ch.DeviceResults[id] = result
+		ch.DeviceEndsAt[id] = endAt
+	}
+	if err := s.processDueLocked(now); err != nil {
+		return nil, err
+	}
+	s.refreshChangeStatusLocked(ch, now)
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return cloneChange(ch), nil
+}
+
+func deviceSet(devices []string, targets map[string]Config) map[string]bool {
+	out := map[string]bool{}
+	if len(devices) == 0 {
+		for id := range targets {
+			out[id] = true
+		}
+		return out
+	}
+	for _, id := range devices {
+		if _, ok := targets[id]; ok {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func allDeviceResults(ch *Change, want Status) bool {
+	if len(ch.DeviceResults) == 0 {
+		return false
+	}
+	for _, result := range ch.DeviceResults {
+		if result.Status != want {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) processDueLocked(now time.Time) error {
+	if s.clock == nil || now.Before(*s.clock) {
+		return nil
+	}
+	s.clock = timePtrUTC(now)
+	for {
+		changed, err := s.runDueOnceLocked(now)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return nil
+		}
+	}
+}
+
+func timePtrUTC(t time.Time) *time.Time {
+	u := t.UTC()
+	return &u
+}
+
+type dueEvent struct {
+	at       time.Time
+	changeID string
+	deviceID string
+	kind     string
+}
+
+func (s *Store) runDueOnceLocked(now time.Time) (bool, error) {
+	events := make([]dueEvent, 0)
+	for _, ch := range s.changes {
+		for id, result := range ch.DeviceResults {
+			if result.Scheduled && result.Status == StatusScheduled && result.StartAt != nil && !result.StartAt.After(now) {
+				events = append(events, dueEvent{at: *result.StartAt, changeID: ch.ID, deviceID: id, kind: "start"})
+			}
+			if result.EndAt != nil && !result.EndAt.After(now) {
+				if result.EndReason != "" {
+					continue
+				}
+				switch result.Status {
+				case StatusPending, StatusDelivered, StatusEffective, StatusPartial, StatusFailed:
+					events = append(events, dueEvent{at: *result.EndAt, changeID: ch.ID, deviceID: id, kind: "end"})
+				}
+			}
+		}
+	}
+	if len(events) == 0 {
+		return false, nil
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if !events[i].at.Equal(events[j].at) {
+			return events[i].at.Before(events[j].at)
+		}
+		if events[i].kind != events[j].kind {
+			return events[i].kind == "start"
+		}
+		if events[i].changeID != events[j].changeID {
+			return events[i].changeID < events[j].changeID
+		}
+		return events[i].deviceID < events[j].deviceID
+	})
+	event := events[0]
+	ch := s.changes[event.changeID]
+	if event.kind == "start" {
+		s.activateScheduledDeviceLocked(ch, event.deviceID, event.at)
+	} else {
+		if err := s.finishReservationDeviceLocked(ch, event.deviceID, event.at, "EXPIRED"); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (s *Store) activateScheduledDeviceLocked(ch *Change, deviceID string, now time.Time) {
+	d := s.deviceLocked(deviceID)
+	if active := s.currentChangeForDeviceLocked(deviceID); active != nil {
+		if active.StartAt != nil {
+			s.coverDeviceInChangeLocked(active, deviceID, now)
+		} else {
+			s.supersedeDeviceInChangeLocked(active, deviceID, now)
+			ch.Supersedes = appendUnique(ch.Supersedes, active.ID)
+		}
+	}
+	if current := s.changes[d.DesiredChangeID]; current != nil && current.ID != ch.ID && current.StartAt != nil {
+		if result := current.DeviceResults[deviceID]; result.Status == StatusEffective && result.EndAt != nil && result.EndAt.After(now) {
+			s.coverDeviceInChangeLocked(current, deviceID, now)
+		}
+	}
+	for _, queued := range s.queuedChangesForDeviceLocked(deviceID) {
+		s.supersedeDeviceInChangeLocked(queued, deviceID, now)
+		ch.Supersedes = appendUnique(ch.Supersedes, queued.ID)
+	}
+	scheduledResult := ch.DeviceResults[deviceID]
+	creationBaseline := cloneConfig(ch.BaselineTargets[deviceID])
+	s.assignTargetToDeviceLocked(ch, deviceID, ch.Targets[deviceID], d, now, nil, scheduledResult.EndAt)
+	ch.BaselineTargets[deviceID] = creationBaseline
+	result := ch.DeviceResults[deviceID]
+	result.StartAt = scheduledResult.StartAt
+	ch.DeviceResults[deviceID] = result
+	s.refreshChangeStatusLocked(ch, now)
+}
+
+func (s *Store) coverDeviceInChangeLocked(ch *Change, deviceID string, now time.Time) {
+	result := ch.DeviceResults[deviceID]
+	result.DispatchState = "OVERLAPPED"
+	result.WaitReason = "WAITING_OVERLAPPING_RESERVATION"
+	result.UpdatedAt = now
+	ch.DeviceResults[deviceID] = result
+	s.refreshChangeStatusLocked(ch, now)
+}
+
+func (s *Store) finishReservationDeviceLocked(reservation *Change, deviceID string, now time.Time, reason string) error {
+	d := s.deviceLocked(deviceID)
+	result := reservation.DeviceResults[deviceID]
+	currentReservation := d.DesiredChangeID == reservation.ID && result.DesiredRev == d.DesiredRev
+	if current := s.changes[d.DesiredChangeID]; current != nil && current.Kind == ChangeKindRestoration && current.RestoresToChange == reservation.ID {
+		currentReservation = true
+	}
+	result.EndReason = reason
+	result.WaitReason = "WAITING_RESTORE_CONFIRMATION"
+	if result.Status == StatusEffective {
+		if reason == "CANCELLED" {
+			result.DispatchState = "CANCELLED_EFFECTIVE"
+		} else {
+			result.DispatchState = "EXPIRED_EFFECTIVE"
+		}
+	} else {
+		if reason == "CANCELLED" {
+			result.Status = StatusCancelled
+			result.DispatchState = "CANCELLED"
+		} else {
+			result.Status = StatusExpired
+			result.DispatchState = "EXPIRED"
+		}
+	}
+	result.UpdatedAt = now
+	reservation.DeviceResults[deviceID] = result
+	s.refreshChangeStatusLocked(reservation, now)
+	_, activeTargetChange, _ := s.restoreTargetLocked(deviceID, reservation, now)
+	if currentReservation {
+		target, targetChange, ok := s.restoreTargetLocked(deviceID, reservation, now)
+		activeTargetChange = targetChange
+		if ok {
+			if err := s.createRestorationLocked(deviceID, target, targetChange, reservation, now); err != nil {
+				return err
+			}
+		} else {
+			result = reservation.DeviceResults[deviceID]
+			result.WaitReason = ""
+			reservation.DeviceResults[deviceID] = result
+		}
+	} else if d.DesiredChangeID == activeTargetChange.ID {
+		result = reservation.DeviceResults[deviceID]
+		result.WaitReason = "WAITING_OVERLAPPING_RESERVATION_CONFIRMATION"
+		reservation.DeviceResults[deviceID] = result
+	}
+	if activeTargetChange != nil {
+		reservation.RestoresToChange = activeTargetChange.ID
+	}
+	return nil
+}
+
+func (s *Store) createRestorationLocked(deviceID string, target Config, targetChange *Change, reservation *Change, now time.Time) error {
+	s.changeSeq++
+	restore := &Change{
+		ID:               fmt.Sprintf("G%06d", s.changeSeq),
+		Kind:             ChangeKindRestoration,
+		Targets:          map[string]Config{deviceID: cloneConfig(target)},
+		BaselineTargets:  map[string]Config{},
+		DeliveredRevs:    map[string]int64{},
+		DeviceResults:    map[string]ChangeDeviceResult{},
+		Status:           StatusPending,
+		Strategy:         ChangeStrategySupersede,
+		Supersedes:       []string{},
+		ReadyDevices:     []string{},
+		WaitingDevices:   []string{},
+		RestoresToChange: targetChange.ID,
+		CreatedAt:        now,
+	}
+	d := s.deviceLocked(deviceID)
+	if previous := s.changes[d.DesiredChangeID]; previous != nil && previous.ID != reservation.ID {
+		if previous.StartAt != nil {
+			s.coverDeviceInChangeLocked(previous, deviceID, now)
+		} else {
+			s.supersedeDeviceInChangeLocked(previous, deviceID, now)
+			restore.Supersedes = appendUnique(restore.Supersedes, previous.ID)
+		}
+	}
+	result := reservation.DeviceResults[deviceID]
+	if result.Status == StatusEffective {
+		if result.EndReason == "CANCELLED" {
+			result.DispatchState = "CANCELLED_EFFECTIVE"
+		} else {
+			result.DispatchState = "EXPIRED_EFFECTIVE"
+		}
+	} else if result.EndReason == "CANCELLED" {
+		result.Status = StatusCancelled
+		result.DispatchState = "CANCELLED"
+	} else {
+		result.Status = StatusExpired
+		result.DispatchState = "EXPIRED"
+	}
+	result.RestoresFor = restore.ID
+	result.WaitReason = "WAITING_RESTORE_CONFIRMATION"
+	reservation.DeviceResults[deviceID] = result
+	s.assignTargetToDeviceLocked(restore, deviceID, target, d, now, nil, nil)
+	r := restore.DeviceResults[deviceID]
+	r.RestoresFor = reservation.ID
+	restore.DeviceResults[deviceID] = r
+	restore.ReadyDevices = []string{deviceID}
+	reservation.RestoreChanges = appendUnique(reservation.RestoreChanges, restore.ID)
+	s.refreshChangeStatusLocked(restore, now)
+	s.refreshChangeStatusLocked(reservation, now)
+	s.changes[restore.ID] = restore
+	return nil
+}
+
+func (s *Store) restoreTargetLocked(deviceID string, expiring *Change, now time.Time) (Config, *Change, bool) {
+	candidates := make([]*Change, 0)
+	for _, ch := range s.changes {
+		if ch.ID == expiring.ID || ch.CancelledAt != nil || ch.Kind == ChangeKindRestoration {
+			continue
+		}
+		result, ok := ch.DeviceResults[deviceID]
+		if !ok {
+			continue
+		}
+		target, ok := ch.Targets[deviceID]
+		if !ok {
+			continue
+		}
+		if ch.StartAt != nil {
+			start := result.StartAt
+			if start == nil {
+				start = ch.StartAt
+			}
+			end := result.EndAt
+			if end == nil {
+				end = ch.EndAt
+			}
+			if start == nil || start.After(now) || (end != nil && !end.After(now)) {
+				continue
+			}
+		}
+		switch result.Status {
+		case StatusScheduled, StatusSuperseded, StatusCancelled:
+			continue
+		}
+		_ = target
+		candidates = append(candidates, ch)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if (candidates[i].StartAt != nil) != (candidates[j].StartAt != nil) {
+			return candidates[i].StartAt != nil
+		}
+		return candidates[i].CreatedAt.After(candidates[j].CreatedAt)
+	})
+	if len(candidates) > 0 {
+		return cloneConfig(candidates[0].Targets[deviceID]), candidates[0], true
+	}
+	fallback := cloneConfig(expiring.BaselineTargets[deviceID])
+	if _, exists := expiring.BaselineTargets[deviceID]; !exists {
+		fallback = s.restoreFallbackLocked(deviceID)
+	}
+	return fallback, expiring, true
+}
+
+func (s *Store) restoreFallbackLocked(deviceID string) Config {
+	d := s.devices[deviceID]
+	if d == nil {
+		return Config{}
+	}
+	return cloneConfig(d.ConfirmedConfig)
+}
+
 // PreviewChange 只计算新目标与各设备当前期望/观察/确认版本之间的差异，不发布、不落盘。
 func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Preview, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
+	if err := s.processDueLocked(now); err != nil {
+		return nil, err
+	}
 	targets, err := normalizeTargets(targets)
 	if err != nil {
 		return nil, err
@@ -210,6 +651,30 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
+	if err := s.processDueLocked(now); err != nil {
+		return nil, err
+	}
+	var startAt, endAt *time.Time
+	if opts.StartAt != nil {
+		t := opts.StartAt.UTC()
+		startAt = &t
+	}
+	if opts.EndAt != nil {
+		t := opts.EndAt.UTC()
+		endAt = &t
+	}
+	if startAt != nil && startAt.Before(now) {
+		return nil, fmt.Errorf("预约开始时间不能早于当前时间")
+	}
+	if endAt != nil {
+		lower := now
+		if startAt != nil {
+			lower = *startAt
+		}
+		if !endAt.After(lower) {
+			return nil, fmt.Errorf("预约结束时间必须晚于开始时间")
+		}
+	}
 	targets, err := normalizeTargets(targets)
 	if err != nil {
 		return nil, err
@@ -241,11 +706,17 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 		BaselineTargets: map[string]Config{},
 		DeliveredRevs:   map[string]int64{},
 		DeviceResults:   map[string]ChangeDeviceResult{},
-		Status:          StatusPending,
 		Strategy:        strategy,
 		ReadyDevices:    []string{},
 		WaitingDevices:  []string{},
 		CreatedAt:       now,
+	}
+	if startAt != nil {
+		ch.StartAt = startAt
+	}
+	if endAt != nil {
+		ch.EndAt = endAt
+		ch.DeviceEndsAt = map[string]time.Time{}
 	}
 	if kind == ChangeKindCompensation {
 		ch.CompensatesFor = opts.CompensatesFor
@@ -258,6 +729,24 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 	sort.Strings(ids)
 	for _, id := range ids {
 		d := s.deviceLocked(id)
+		if startAt != nil {
+			ch.BaselineTargets[id] = cloneConfig(d.ConfirmedConfig)
+			r := ChangeDeviceResult{
+				Status:        StatusScheduled,
+				DispatchState: "SCHEDULED",
+				WaitReason:    "WAITING_SCHEDULED_START",
+				StartAt:       startAt,
+				EndAt:         endAt,
+				UpdatedAt:     now,
+				Scheduled:     true,
+			}
+			ch.DeviceResults[id] = r
+			ch.WaitingDevices = append(ch.WaitingDevices, id)
+			if endAt != nil {
+				ch.DeviceEndsAt[id] = *endAt
+			}
+			continue
+		}
 		previousID := d.DesiredChangeID
 		ch.BaselineTargets[id] = cloneConfig(d.ConfirmedConfig)
 		active := s.currentChangeForDeviceLocked(id)
@@ -285,7 +774,7 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 			c.Open = false
 			c.ResolvedAt = &now
 		}
-		s.assignTargetToDeviceLocked(ch, id, targets[id], d, now)
+		s.assignTargetToDeviceLocked(ch, id, targets[id], d, now, nil, nil)
 		if previousID != "" && previousID != ch.ID {
 			if previous := s.changes[previousID]; previous != nil {
 				s.supersedeDeviceInChangeLocked(previous, id, now)
@@ -337,6 +826,10 @@ func (s *Store) PublishCompensation(changeID string, targets map[string]Config, 
 func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now = now.UTC()
+	if err := s.processDueLocked(now); err != nil {
+		return nil, false, err
+	}
 	d := s.deviceLocked(deviceID)
 	d.Online = true
 	changed := d.DesiredRev > d.DeliveredRev
@@ -350,10 +843,10 @@ func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 				result.Status = StatusDelivered
 				result.DispatchState = "DELIVERED"
 			}
-			result.UpdatedAt = now.UTC()
+			result.UpdatedAt = now
 			ch.DeviceResults[deviceID] = result
 			ch.DeliveredRevs[deviceID] = d.DesiredRev
-			s.refreshChangeStatusLocked(ch, now.UTC())
+			s.refreshChangeStatusLocked(ch, now)
 		}
 	}
 	if err := s.persistLocked(); err != nil {
@@ -367,9 +860,12 @@ func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Device, *Conflict, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now = now.UTC()
+	if err := s.processDueLocked(now); err != nil {
+		return nil, nil, false, err
+	}
 	d := s.deviceLocked(deviceID)
 	d.Online = true
-	now = now.UTC()
 	operationActiveBeforeReport := s.currentChangeForDeviceLocked(deviceID) != nil
 	// 记录最新观察值；上报不改变期望配置。
 	d.ReportedConfig = cloneConfig(req.Applied)
@@ -419,6 +915,28 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 		}
 	}
 	s.recordReportOnChangeLocked(deviceID, req, deviceStatus, false, now)
+	if current := s.changes[d.DesiredChangeID]; current != nil && current.StartAt != nil && deviceStatus == StatusEffective {
+		for _, candidate := range s.changes {
+			if candidate.RestoresToChange != current.ID {
+				continue
+			}
+			if linkedResult, ok := candidate.DeviceResults[deviceID]; ok && linkedResult.WaitReason == "WAITING_OVERLAPPING_RESERVATION_CONFIRMATION" {
+				linkedResult.WaitReason = ""
+				candidate.DeviceResults[deviceID] = linkedResult
+				s.refreshChangeStatusLocked(candidate, now)
+			}
+		}
+	}
+	if current := s.changes[d.DesiredChangeID]; current != nil && current.Kind == ChangeKindRestoration && deviceStatus == StatusEffective {
+		if linkedID := current.DeviceResults[deviceID].RestoresFor; linkedID != "" {
+			if linked := s.changes[linkedID]; linked != nil {
+				linkedResult := linked.DeviceResults[deviceID]
+				linkedResult.WaitReason = ""
+				linked.DeviceResults[deviceID] = linkedResult
+				s.refreshChangeStatusLocked(linked, now)
+			}
+		}
+	}
 	if operationActiveBeforeReport && !stale {
 		s.activateNextQueuedForDeviceLocked(deviceID, now)
 	}
@@ -450,6 +968,8 @@ func (s *Store) MarkOffline(deviceID string) error {
 func (s *Store) View(deviceID string, now time.Time) (*TwinView, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now = now.UTC()
+	_ = s.processDueLocked(now)
 	d, ok := s.devices[deviceID]
 	if !ok {
 		return nil, false
@@ -479,6 +999,8 @@ func (s *Store) viewLocked(d *Device, now time.Time) *TwinView {
 func (s *Store) ListViews(now time.Time) []*TwinView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now = now.UTC()
+	_ = s.processDueLocked(now)
 	ids := make([]string, 0, len(s.devices))
 	for id := range s.devices {
 		ids = append(ids, id)
@@ -512,6 +1034,8 @@ func (s *Store) Conflicts(deviceID string, includeResolved bool) []*Conflict {
 func (s *Store) Change(changeID string) (*ChangeView, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.nowLocked()
+	_ = s.processDueLocked(now)
 	ch, ok := s.changes[changeID]
 	if !ok {
 		return nil, false
@@ -523,6 +1047,8 @@ func (s *Store) Change(changeID string) (*ChangeView, bool) {
 func (s *Store) ListChanges() []*ChangeView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.nowLocked()
+	_ = s.processDueLocked(now)
 	ids := make([]string, 0, len(s.changes))
 	for id := range s.changes {
 		ids = append(ids, id)
@@ -582,15 +1108,22 @@ func (s *Store) deviceOperationActiveLocked(d *Device) bool {
 	return d.DesiredRev > 0 && !d.isDesiredConfirmedLocked()
 }
 
-func (s *Store) assignTargetToDeviceLocked(ch *Change, deviceID string, target Config, d *Device, now time.Time) {
+func (s *Store) assignTargetToDeviceLocked(ch *Change, deviceID string, target Config, d *Device, now time.Time, startAt, endAt *time.Time) {
 	d.DesiredRev++
 	d.DesiredConfig = cloneConfig(target)
 	d.DesiredChangeID = ch.ID
+	if ch.BaselineTargets == nil {
+		ch.BaselineTargets = map[string]Config{}
+	}
+	ch.BaselineTargets[deviceID] = cloneConfig(d.ConfirmedConfig)
 	ch.DeviceResults[deviceID] = ChangeDeviceResult{
 		DesiredRev:    d.DesiredRev,
 		Status:        StatusPending,
 		DispatchState: "READY",
+		StartAt:       startAt,
+		EndAt:         endAt,
 		UpdatedAt:     now,
+		Scheduled:     startAt != nil,
 	}
 }
 
@@ -615,14 +1148,11 @@ func (s *Store) activateNextQueuedForDeviceLocked(deviceID string, now time.Time
 	}
 	next := queued[0]
 	d := s.deviceLocked(deviceID)
-	d.DesiredRev++
-	d.DesiredConfig = cloneConfig(next.Targets[deviceID])
-	d.DesiredChangeID = next.ID
+	queuedResult := next.DeviceResults[deviceID]
+	s.assignTargetToDeviceLocked(next, deviceID, next.Targets[deviceID], d, now, queuedResult.StartAt, queuedResult.EndAt)
 	result := next.DeviceResults[deviceID]
-	result.DesiredRev = d.DesiredRev
-	result.Status = StatusPending
-	result.DispatchState = "READY"
 	result.WaitForChange = ""
+	result.WaitReason = ""
 	result.UpdatedAt = now
 	next.DeviceResults[deviceID] = result
 	next.WaitingDevices = removeString(next.WaitingDevices, deviceID)
@@ -703,9 +1233,22 @@ func (s *Store) recordReportOnChangeLocked(deviceID string, req ReportRequest, r
 		ch.DeviceResults[deviceID] = result
 		s.refreshChangeStatusLocked(ch, now)
 	} else {
+		if stale && (result.Status == StatusExpired || result.Status == StatusEffective) {
+			switch resultStatus {
+			case StatusEffective:
+				result.DispatchState = "LATE_EFFECTIVE"
+			case StatusPartial:
+				result.DispatchState = "LATE_PARTIAL"
+			case StatusFailed:
+				result.DispatchState = "LATE_FAILED"
+			}
+			result.Stale = true
+		}
 		if stale && resultStatus != StatusEffective && result.Status != StatusEffective {
-			result.Status = StatusSuperseded
-			result.DispatchState = "STALE"
+			if result.Status != StatusExpired {
+				result.Status = StatusSuperseded
+				result.DispatchState = "STALE"
+			}
 		}
 		ch.DeviceResults[deviceID] = result
 		s.refreshChangeStatusLocked(ch, now)
@@ -718,6 +1261,8 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 	for id, result := range ch.DeviceResults {
 		switch result.Status {
 		case StatusQueued:
+			ch.WaitingDevices = append(ch.WaitingDevices, id)
+		case StatusScheduled:
 			ch.WaitingDevices = append(ch.WaitingDevices, id)
 		case StatusPending, StatusDelivered:
 			ch.ReadyDevices = append(ch.ReadyDevices, id)
@@ -737,8 +1282,11 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 	allTerminalReplaced := true
 	hasSuperseded := false
 	allTerminal := true
+	hasEnded := false
 	for _, result := range ch.DeviceResults {
 		if result.Status != StatusEffective {
+			allEffective = false
+		} else if result.EndReason != "" {
 			allEffective = false
 		}
 		if result.Status != StatusEffective && result.Status != StatusSuperseded {
@@ -750,11 +1298,16 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 		if result.Status == StatusEffective && result.DispatchState == "SUPERSEDED" {
 			hasSuperseded = true
 		}
-		if result.Status == StatusQueued || isDeviceOperationStatus(result.Status) {
+		if result.Status == StatusQueued || result.Status == StatusScheduled || isDeviceOperationStatus(result.Status) {
 			allTerminal = false
+		}
+		if result.EndReason != "" {
+			hasEnded = true
 		}
 	}
 	switch {
+	case (hasStatus(StatusExpired) || (hasEnded && !hasStatus(StatusScheduled) && !hasStatus(StatusQueued))):
+		ch.Status = StatusExpired
 	case allTerminalReplaced && hasSuperseded:
 		ch.Status = StatusSuperseded
 		if ch.SupersededAt == nil {
@@ -765,6 +1318,8 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 		if ch.EffectiveAt == nil {
 			ch.EffectiveAt = &now
 		}
+	case hasStatus(StatusCancelled):
+		ch.Status = StatusCancelled
 	case hasStatus(StatusPartial):
 		ch.Status = StatusPartial
 	case hasStatus(StatusFailed):
@@ -774,6 +1329,8 @@ func (s *Store) refreshChangeStatusLocked(ch *Change, now time.Time) {
 		if ch.SupersededAt == nil {
 			ch.SupersededAt = &now
 		}
+	case hasStatus(StatusScheduled):
+		ch.Status = StatusScheduled
 	case len(ch.WaitingDevices) > 0:
 		ch.Status = StatusQueued
 	case hasStatus(StatusDelivered):
@@ -801,12 +1358,17 @@ func cloneChange(ch *Change) *Change {
 		cp.DeliveredRevs[id] = rev
 	}
 	cp.DeviceResults = map[string]ChangeDeviceResult{}
+	cp.DeviceEndsAt = map[string]time.Time{}
+	for id, t := range ch.DeviceEndsAt {
+		cp.DeviceEndsAt[id] = t
+	}
 	for id, result := range ch.DeviceResults {
 		result.AppliedConfig = cloneConfig(result.AppliedConfig)
 		result.Rejected = cloneConfig(result.Rejected)
 		cp.DeviceResults[id] = result
 	}
 	cp.Supersedes = append([]string(nil), ch.Supersedes...)
+	cp.RestoreChanges = append([]string(nil), ch.RestoreChanges...)
 	cp.ReadyDevices = append([]string(nil), ch.ReadyDevices...)
 	cp.WaitingDevices = append([]string(nil), ch.WaitingDevices...)
 	return &cp
@@ -837,6 +1399,12 @@ func statusText(st Status) string {
 		return "已被新目标替代，历史保留"
 	case StatusQueued:
 		return "等待先前设备操作结束"
+	case StatusScheduled:
+		return "预约等待生效时间"
+	case StatusExpired:
+		return "预约有效期已结束，等待恢复收尾确认"
+	case StatusCancelled:
+		return "预约已取消"
 	default:
 		return "待下发"
 	}

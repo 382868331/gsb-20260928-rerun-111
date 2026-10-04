@@ -23,6 +23,12 @@ const (
 	StatusSuperseded Status = "SUPERSEDED"
 	// StatusQueued 目标正在等待同一设备先前操作结束，尚未生成期望版本。
 	StatusQueued Status = "QUEUED"
+	// StatusScheduled 预约时间尚未到达，服务端还不应把它下发成设备期望。
+	StatusScheduled Status = "SCHEDULED"
+	// StatusExpired 预约有效期已结束；是否真的恢复仍要看恢复变更的设备确认。
+	StatusExpired Status = "EXPIRED"
+	// StatusCancelled 预约尚未发生或剩余设备被操作者取消。
+	StatusCancelled Status = "CANCELLED"
 )
 
 type ChangeKind string
@@ -30,6 +36,7 @@ type ChangeKind string
 const (
 	ChangeKindTarget       ChangeKind = "TARGET"
 	ChangeKindCompensation ChangeKind = "COMPENSATION"
+	ChangeKindRestoration  ChangeKind = "RESTORATION"
 )
 
 type ChangeStrategy string
@@ -44,34 +51,46 @@ const (
 // Change 是一次面向一组设备整体发布的配置目标。
 // 只有 Targets 中每台设备都精确确认自己的目标，整个变更才生效。
 type Change struct {
-	ID              string                        `json:"id"`
-	Kind            ChangeKind                    `json:"kind"`
-	Targets         map[string]Config             `json:"targets"`
-	BaselineTargets map[string]Config             `json:"baseline_targets,omitempty"`
-	DeliveredRevs   map[string]int64              `json:"delivered_revs"`
-	DeviceResults   map[string]ChangeDeviceResult `json:"device_results"`
-	Status          Status                        `json:"status"`
-	Strategy        ChangeStrategy                `json:"strategy"`
-	ReadyDevices    []string                      `json:"ready_devices,omitempty"`
-	WaitingDevices  []string                      `json:"waiting_devices,omitempty"`
-	Supersedes      []string                      `json:"supersedes,omitempty"`
-	CompensatesFor  string                        `json:"compensates_for,omitempty"`
-	CreatedAt       time.Time                     `json:"created_at"`
-	EffectiveAt     *time.Time                    `json:"effective_at,omitempty"`
-	SupersededAt    *time.Time                    `json:"superseded_at,omitempty"`
+	ID               string                        `json:"id"`
+	Kind             ChangeKind                    `json:"kind"`
+	Targets          map[string]Config             `json:"targets"`
+	BaselineTargets  map[string]Config             `json:"baseline_targets,omitempty"`
+	DeliveredRevs    map[string]int64              `json:"delivered_revs"`
+	DeviceResults    map[string]ChangeDeviceResult `json:"device_results"`
+	Status           Status                        `json:"status"`
+	Strategy         ChangeStrategy                `json:"strategy"`
+	ReadyDevices     []string                      `json:"ready_devices,omitempty"`
+	WaitingDevices   []string                      `json:"waiting_devices,omitempty"`
+	Supersedes       []string                      `json:"supersedes,omitempty"`
+	CompensatesFor   string                        `json:"compensates_for,omitempty"`
+	StartAt          *time.Time                    `json:"start_at,omitempty"`
+	EndAt            *time.Time                    `json:"end_at,omitempty"`
+	CancelledAt      *time.Time                    `json:"cancelled_at,omitempty"`
+	DeviceEndsAt     map[string]time.Time          `json:"device_ends_at,omitempty"`
+	RestoreChanges   []string                      `json:"restore_changes,omitempty"`
+	RestoresToChange string                        `json:"restores_to_change,omitempty"`
+	CreatedAt        time.Time                     `json:"created_at"`
+	EffectiveAt      *time.Time                    `json:"effective_at,omitempty"`
+	SupersededAt     *time.Time                    `json:"superseded_at,omitempty"`
 }
 
 type ChangeDeviceResult struct {
-	DesiredRev    int64     `json:"desired_rev"`
-	DeliveredRev  int64     `json:"delivered_rev"`
-	ReportedRev   int64     `json:"reported_rev"`
-	AppliedConfig Config    `json:"applied_config"`
-	Rejected      Config    `json:"rejected,omitempty"`
-	Status        Status    `json:"status"`
-	DispatchState string    `json:"dispatch_state,omitempty"`
-	WaitForChange string    `json:"wait_for_change,omitempty"`
-	Stale         bool      `json:"stale,omitempty"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	DesiredRev    int64      `json:"desired_rev"`
+	DeliveredRev  int64      `json:"delivered_rev"`
+	ReportedRev   int64      `json:"reported_rev"`
+	AppliedConfig Config     `json:"applied_config"`
+	Rejected      Config     `json:"rejected,omitempty"`
+	Status        Status     `json:"status"`
+	DispatchState string     `json:"dispatch_state,omitempty"`
+	WaitForChange string     `json:"wait_for_change,omitempty"`
+	WaitReason    string     `json:"wait_reason,omitempty"`
+	StartAt       *time.Time `json:"start_at,omitempty"`
+	EndAt         *time.Time `json:"end_at,omitempty"`
+	EndReason     string     `json:"end_reason,omitempty"`
+	RestoresFor   string     `json:"restores_for,omitempty"`
+	Stale         bool       `json:"stale,omitempty"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	Scheduled     bool       `json:"scheduled,omitempty"`
 }
 
 // Device 保存一台设备的孪生三态：期望、已上报、已确认。
@@ -98,7 +117,7 @@ type Device struct {
 
 // Status 计算当前期望版本所处状态。
 func (d *Device) Status(now time.Time) Status {
-	if len(d.DesiredConfig) == 0 {
+	if d.DesiredRev == 0 {
 		return StatusPending
 	}
 	if d.DesiredRev > 0 && d.ConfirmedRev >= d.DesiredRev && configEqual(d.ConfirmedConfig, d.DesiredConfig) {
