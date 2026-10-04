@@ -672,6 +672,88 @@ func TestOverlappingReservationsExpireToCurrentlyValidTarget(t *testing.T) {
 	}
 }
 
+func TestNormalClockOverlappingReservationsContinueAfterRestart(t *testing.T) {
+	c, _, dbPath := newHarness(t)
+	t0 := time.Now().UTC()
+	r1Start := t0.Add(2 * time.Second)
+	r2Start := t0.Add(3 * time.Second)
+	r1End := t0.Add(4 * time.Second)
+	r2End := t0.Add(5 * time.Second)
+
+	r1 := c.schedule(map[string]twin.Config{"dev-1": {"temp": "18"}}, r1Start, r1End)
+	r2 := c.schedule(map[string]twin.Config{"dev-1": {"temp": "16"}}, r2Start, r2End)
+
+	waitUntil(t, r1Start.Add(50*time.Millisecond))
+	r1 = c.change(r1.ID)
+	if rev, cfg := c.pull("dev-1"); rev != r1.DeviceResults["dev-1"].DesiredRev || cfg["temp"] != "18" {
+		t.Fatalf("正常时间到点后拉取应得到 r1，rev=%d cfg=%v", rev, cfg)
+	}
+	c.report("dev-1", twin.ReportRequest{Rev: r1.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "18"}})
+
+	waitUntil(t, r2Start.Add(50*time.Millisecond))
+	if got := c.change(r1.ID).DeviceResults["dev-1"].DispatchState; got != "OVERLAPPED" {
+		t.Fatalf("正常时间查询跨过 r2 开始时间后应覆盖 r1，得到 %s", got)
+	}
+	if got := c.twin("dev-1"); got.DesiredChangeID != r2.ID || got.DesiredConfig["temp"] != "16" {
+		t.Fatalf("正常时间查询应切换到 r2 目标，得到 %+v", got)
+	}
+
+	waitUntil(t, r1End.Add(50*time.Millisecond))
+	c2 := newHarnessFromPath(t, dbPath)
+	if got := c2.twin("dev-1"); got.DesiredChangeID != r2.ID || got.DesiredConfig["temp"] != "16" {
+		t.Fatalf("重开后应继续处理重叠预约 r2，得到 %+v", got)
+	}
+	r2 = c2.change(r2.ID)
+	if got := c2.change(r1.ID).DeviceResults["dev-1"].WaitReason; got != "WAITING_OVERLAPPING_RESERVATION_CONFIRMATION" {
+		t.Fatalf("重开后 r1 应等待 r2 设备确认，得到 %q", got)
+	}
+	c2.pull("dev-1")
+	c2.report("dev-1", twin.ReportRequest{Rev: r2.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "16"}})
+
+	waitUntil(t, r2End.Add(50*time.Millisecond))
+	c3 := newHarnessFromPath(t, dbPath)
+	r2 = c3.change(r2.ID)
+	restore := c3.restoreFor(r2, "dev-1")
+	if got := c3.twin("dev-1"); got.DesiredChangeID != restore.ID || got.Status == twin.StatusEffective || got.ConfirmedConfig["temp"] != "16" {
+		t.Fatalf("重开后到期只能生成待确认恢复目标，得到 %+v", got)
+	}
+	c3.pull("dev-1")
+	c3.report("dev-1", twin.ReportRequest{Rev: restore.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{}})
+	if got := c3.twin("dev-1"); got.Status != twin.StatusEffective || got.DesiredChangeID != restore.ID || len(got.ConfirmedConfig) != 0 {
+		t.Fatalf("恢复目标经设备确认后才应回到基线，得到 %+v", got)
+	}
+}
+
+func TestVirtualClockCancelRequiresRestorationConfirmation(t *testing.T) {
+	c, _, _ := newHarness(t)
+	t0 := time.Date(2026, 10, 3, 20, 0, 0, 0, time.UTC)
+	c.clock(t0)
+	r := c.schedule(map[string]twin.Config{"dev-1": {"temp": "18"}}, t0.Add(time.Hour), t0.Add(5*time.Hour))
+	c.clock(t0.Add(time.Hour))
+	r = c.change(r.ID)
+	c.pull("dev-1")
+	c.report("dev-1", twin.ReportRequest{Rev: r.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{"temp": "18"}})
+
+	c.cancel(r.ID)
+	r = c.change(r.ID)
+	restore := c.restoreFor(r, "dev-1")
+	if got := c.twin("dev-1"); got.DesiredChangeID != restore.ID || got.Status == twin.StatusEffective || got.ConfirmedConfig["temp"] != "18" {
+		t.Fatalf("取消后只能下发待确认恢复目标，已确认临时效果应保留，得到 %+v", got)
+	}
+	c.pull("dev-1")
+	c.report("dev-1", twin.ReportRequest{Rev: restore.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{}})
+	if got := c.twin("dev-1"); got.Status != twin.StatusEffective || len(got.ConfirmedConfig) != 0 {
+		t.Fatalf("取消恢复必须经设备确认后完成，得到 %+v", got)
+	}
+}
+
+func waitUntil(t *testing.T, target time.Time) {
+	t.Helper()
+	for time.Now().Before(target) {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestShortenAndCancelReservationKeepObservedEffects(t *testing.T) {
 	c, _, _ := newHarness(t)
 	t0 := time.Date(2026, 10, 2, 20, 0, 0, 0, time.UTC)

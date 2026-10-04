@@ -48,6 +48,18 @@ func NewStore(path string) (*Store, error) {
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	if s.clock == nil {
+		s.mu.Lock()
+		now := time.Now().UTC()
+		changed, err := s.processDueLocked(now)
+		if err == nil && changed {
+			err = s.persistLocked()
+		}
+		s.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -172,7 +184,7 @@ func (s *Store) SetVirtualClock(t time.Time) error {
 	defer s.mu.Unlock()
 	now := t.UTC()
 	s.clock = &now
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return err
 	}
 	return s.persistLocked()
@@ -189,7 +201,7 @@ func (s *Store) CancelReservation(changeID string, devices []string, now time.Ti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, err
 	}
 	ch, ok := s.changes[changeID]
@@ -243,7 +255,7 @@ func (s *Store) ShortenReservation(changeID string, endAt time.Time, devices []s
 	defer s.mu.Unlock()
 	now = now.UTC()
 	endAt = endAt.UTC()
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, err
 	}
 	ch, ok := s.changes[changeID]
@@ -270,7 +282,7 @@ func (s *Store) ShortenReservation(changeID string, endAt time.Time, devices []s
 		ch.DeviceResults[id] = result
 		ch.DeviceEndsAt[id] = endAt
 	}
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, err
 	}
 	s.refreshChangeStatusLocked(ch, now)
@@ -308,20 +320,32 @@ func allDeviceResults(ch *Change, want Status) bool {
 	return true
 }
 
-func (s *Store) processDueLocked(now time.Time) error {
-	if s.clock == nil || now.Before(*s.clock) {
-		return nil
+func (s *Store) processDueLocked(now time.Time) (bool, error) {
+	if s.clock != nil {
+		if now.Before(*s.clock) {
+			return false, nil
+		}
+		s.clock = timePtrUTC(now)
 	}
-	s.clock = timePtrUTC(now)
+	changed := false
 	for {
-		changed, err := s.runDueOnceLocked(now)
+		due, err := s.runDueOnceLocked(now)
 		if err != nil {
-			return err
+			return changed, err
 		}
-		if !changed {
-			return nil
+		if !due {
+			return changed, nil
 		}
+		changed = true
 	}
+}
+
+func (s *Store) processDueAndPersistLocked(now time.Time) error {
+	changed, err := s.processDueLocked(now)
+	if err != nil || !changed {
+		return err
+	}
+	return s.persistLocked()
 }
 
 func timePtrUTC(t time.Time) *time.Time {
@@ -588,7 +612,7 @@ func (s *Store) PreviewChange(targets map[string]Config, now time.Time) (*Previe
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, err
 	}
 	targets, err := normalizeTargets(targets)
@@ -651,7 +675,7 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, err
 	}
 	var startAt, endAt *time.Time
@@ -827,7 +851,7 @@ func (s *Store) Pull(deviceID string, now time.Time) (*Device, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, false, err
 	}
 	d := s.deviceLocked(deviceID)
@@ -861,7 +885,7 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	if err := s.processDueLocked(now); err != nil {
+	if _, err := s.processDueLocked(now); err != nil {
 		return nil, nil, false, err
 	}
 	d := s.deviceLocked(deviceID)
@@ -960,21 +984,26 @@ func (s *Store) resolveOpenLocked(deviceID string, reason ConflictReason, rev in
 func (s *Store) MarkOffline(deviceID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.processDueAndPersistLocked(s.nowLocked()); err != nil {
+		return err
+	}
 	d := s.deviceLocked(deviceID)
 	d.Online = false
 	return s.persistLocked()
 }
 
-func (s *Store) View(deviceID string, now time.Time) (*TwinView, bool) {
+func (s *Store) View(deviceID string, now time.Time) (*TwinView, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	_ = s.processDueLocked(now)
+	if err := s.processDueAndPersistLocked(now); err != nil {
+		return nil, false, err
+	}
 	d, ok := s.devices[deviceID]
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
-	return s.viewLocked(d, now), true
+	return s.viewLocked(d, now), true, nil
 }
 
 func (s *Store) viewLocked(d *Device, now time.Time) *TwinView {
@@ -996,11 +1025,13 @@ func (s *Store) viewLocked(d *Device, now time.Time) *TwinView {
 	}
 }
 
-func (s *Store) ListViews(now time.Time) []*TwinView {
+func (s *Store) ListViews(now time.Time) ([]*TwinView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now = now.UTC()
-	_ = s.processDueLocked(now)
+	if err := s.processDueAndPersistLocked(now); err != nil {
+		return nil, err
+	}
 	ids := make([]string, 0, len(s.devices))
 	for id := range s.devices {
 		ids = append(ids, id)
@@ -1010,7 +1041,7 @@ func (s *Store) ListViews(now time.Time) []*TwinView {
 	for _, id := range ids {
 		views = append(views, s.viewLocked(s.devices[id], now))
 	}
-	return views
+	return views, nil
 }
 
 func (s *Store) Conflicts(deviceID string, includeResolved bool) []*Conflict {
@@ -1031,24 +1062,28 @@ func (s *Store) Conflicts(deviceID string, includeResolved bool) []*Conflict {
 	return out
 }
 
-func (s *Store) Change(changeID string) (*ChangeView, bool) {
+func (s *Store) Change(changeID string) (*ChangeView, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.nowLocked()
-	_ = s.processDueLocked(now)
+	if err := s.processDueAndPersistLocked(now); err != nil {
+		return nil, false, err
+	}
 	ch, ok := s.changes[changeID]
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	v := ChangeView{Change: cloneChange(ch), StatusText: statusText(ch.Status)}
-	return &v, true
+	return &v, true, nil
 }
 
-func (s *Store) ListChanges() []*ChangeView {
+func (s *Store) ListChanges() ([]*ChangeView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.nowLocked()
-	_ = s.processDueLocked(now)
+	if err := s.processDueAndPersistLocked(now); err != nil {
+		return nil, err
+	}
 	ids := make([]string, 0, len(s.changes))
 	for id := range s.changes {
 		ids = append(ids, id)
@@ -1059,7 +1094,7 @@ func (s *Store) ListChanges() []*ChangeView {
 		ch := s.changes[id]
 		out = append(out, &ChangeView{Change: cloneChange(ch), StatusText: statusText(ch.Status)})
 	}
-	return out
+	return out, nil
 }
 
 func normalizeTargets(targets map[string]Config) (map[string]Config, error) {

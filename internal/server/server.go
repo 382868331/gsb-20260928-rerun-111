@@ -58,7 +58,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"devices": s.store.ListViews(s.now())})
+	views, err := s.store.ListViews(s.now())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"devices": views})
 }
 
 func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
@@ -73,10 +78,17 @@ func (s *Server) setDesired(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	changeID := ""
+	if view, _, viewErr := s.store.View(id, s.now()); viewErr != nil {
+		writeErr(w, http.StatusInternalServerError, viewErr.Error())
+		return
+	} else if view != nil {
+		changeID = view.DesiredChangeID
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"device_id":   id,
 		"desired_rev": rev,
-		"change_id":   s.mustView(id).DesiredChangeID,
+		"change_id":   changeID,
 		"status":      string(twin.StatusPending),
 		"status_text": statusText(twin.StatusPending),
 	})
@@ -194,7 +206,11 @@ func (s *Server) getClock(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
-	ch, ok := s.store.Change(r.PathValue("id"))
+	ch, ok, err := s.store.Change(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if !ok {
 		writeErr(w, http.StatusNotFound, "变更不存在")
 		return
@@ -203,7 +219,12 @@ func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listChanges(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"changes": s.store.ListChanges()})
+	changes, err := s.store.ListChanges()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"changes": changes})
 }
 
 func (s *Server) compensateChange(w http.ResponseWriter, r *http.Request) {
@@ -248,9 +269,14 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	twinView, _, viewErr := s.store.View(id, s.now())
+	if viewErr != nil {
+		writeErr(w, http.StatusInternalServerError, viewErr.Error())
+		return
+	}
 	resp := map[string]any{
 		"stale": stale,
-		"twin":  s.mustView(id),
+		"twin":  twinView,
 	}
 	if stale {
 		resp["message"] = "上报版本已过时，已记录冲突，未更新确认状态"
@@ -259,14 +285,6 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request) {
 		resp["conflict"] = conflict
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *Server) mustView(id string) *twin.TwinView {
-	v, ok := s.store.View(id, s.now())
-	if !ok {
-		return nil
-	}
-	return v
 }
 
 func (s *Server) offline(w http.ResponseWriter, r *http.Request) {
@@ -280,7 +298,11 @@ func (s *Server) offline(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getTwin(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	v, ok := s.store.View(id, s.now())
+	v, ok, err := s.store.View(id, s.now())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if !ok {
 		writeErr(w, http.StatusNotFound, "设备不存在")
 		return
