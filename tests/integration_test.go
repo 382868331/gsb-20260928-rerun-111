@@ -139,15 +139,15 @@ func (c testClient) compensate(id string, targets map[string]twin.Config) twin.C
 }
 
 func (c testClient) clock(now time.Time) {
-	c.do(http.MethodPost, "/clock", map[string]any{"now": now.UTC().Format(time.RFC3339)}, nil)
+	c.do(http.MethodPost, "/clock", map[string]any{"now": now.UTC().Format(time.RFC3339Nano)}, nil)
 }
 
 func (c testClient) schedule(targets map[string]twin.Config, start, end time.Time) twin.Change {
 	var ch twin.Change
 	body := map[string]any{
 		"targets":  targets,
-		"start_at": start.UTC().Format(time.RFC3339),
-		"end_at":   end.UTC().Format(time.RFC3339),
+		"start_at": start.UTC().Format(time.RFC3339Nano),
+		"end_at":   end.UTC().Format(time.RFC3339Nano),
 	}
 	c.do(http.MethodPost, "/changes", body, &ch)
 	return ch
@@ -155,7 +155,7 @@ func (c testClient) schedule(targets map[string]twin.Config, start, end time.Tim
 
 func (c testClient) shorten(id string, end time.Time, devices ...string) twin.Change {
 	var ch twin.Change
-	body := map[string]any{"end_at": end.UTC().Format(time.RFC3339), "devices": devices}
+	body := map[string]any{"end_at": end.UTC().Format(time.RFC3339Nano), "devices": devices}
 	c.do(http.MethodPost, "/changes/"+id+"/shorten", body, &ch)
 	return ch
 }
@@ -709,5 +709,141 @@ func TestShortenAndCancelReservationKeepObservedEffects(t *testing.T) {
 	}
 	if got := c.change(r.ID).DeviceResults["dev-1"].AppliedConfig["temp"]; got != "18" {
 		t.Fatalf("已发生的临时效果历史必须保留，得到 %q", got)
+	}
+}
+
+// 预约生命周期对照：开始时刻只生成待拉取目标，结束时刻生成恢复目标，
+// 恢复目标必须经设备确认后才算完成。正常时钟与虚拟时钟走同一套规则。
+func exerciseReservationLifecycle(t *testing.T, c testClient, start, end time.Time, wait func(target time.Time)) {
+	t.Helper()
+	r := c.schedule(map[string]twin.Config{"dev-1": {"temp": "18"}}, start, end)
+	if got := c.change(r.ID).Status; got != twin.StatusScheduled {
+		t.Fatalf("预约未到开始时间应为 SCHEDULED，得到 %s", got)
+	}
+
+	wait(start)
+	r = c.change(r.ID)
+	rev := r.DeviceResults["dev-1"].DesiredRev
+	if rev == 0 {
+		t.Fatal("跨过开始时刻应生成待设备拉取的目标")
+	}
+	gotRev, cfg := c.pull("dev-1")
+	if gotRev != rev || cfg["temp"] != "18" {
+		t.Fatalf("到点后设备应拉到预约目标，rev=%d cfg=%v", gotRev, cfg)
+	}
+	c.report("dev-1", twin.ReportRequest{Rev: rev, Applied: twin.Config{"temp": "18"}})
+	if got := c.change(r.ID).DeviceResults["dev-1"].Status; got != twin.StatusEffective {
+		t.Fatalf("设备确认后预约才 EFFECTIVE，得到 %s", got)
+	}
+
+	wait(end)
+	r = c.change(r.ID)
+	if got := r.Status; got != twin.StatusExpired {
+		t.Fatalf("跨过结束时刻应 EXPIRED，得到 %s", got)
+	}
+	if got := r.DeviceResults["dev-1"].WaitReason; got != "WAITING_RESTORE_CONFIRMATION" {
+		t.Fatalf("到期后应说明等待恢复确认，得到 %q", got)
+	}
+	restore := c.restoreFor(r, "dev-1")
+	if st := restore.DeviceResults["dev-1"].Status; st != twin.StatusPending && st != twin.StatusDelivered {
+		t.Fatalf("恢复目标应等待设备确认，得到 %s", st)
+	}
+	if v := c.twin("dev-1"); v.ConfirmedConfig["temp"] != "18" {
+		t.Fatalf("恢复目标未经设备确认不能改动已确认状态，得到 %+v", v)
+	}
+	c.pull("dev-1")
+	c.report("dev-1", twin.ReportRequest{Rev: restore.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{}})
+	if v := c.twin("dev-1"); v.Status != twin.StatusEffective || len(v.DesiredConfig) != 0 {
+		t.Fatalf("恢复目标经设备确认后才算完成，得到 %+v", v)
+	}
+}
+
+// 正常时钟：不设置虚拟时钟，预约随真实请求时间启动与到期。
+func TestReservationLifecycleWithRealClock(t *testing.T) {
+	c, _, _ := newHarness(t)
+	now := time.Now().UTC()
+	wait := func(target time.Time) {
+		if d := time.Until(target.Add(60 * time.Millisecond)); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	exerciseReservationLifecycle(t, c, now.Add(200*time.Millisecond), now.Add(600*time.Millisecond), wait)
+}
+
+// 虚拟时钟：同一生命周期在持久化虚拟时间下表现一致。
+func TestReservationLifecycleWithVirtualClock(t *testing.T) {
+	c, _, _ := newHarness(t)
+	t0 := time.Date(2026, 10, 3, 20, 0, 0, 0, time.UTC)
+	c.clock(t0)
+	wait := func(target time.Time) { c.clock(target) }
+	exerciseReservationLifecycle(t, c, t0.Add(time.Hour), t0.Add(3*time.Hour), wait)
+}
+
+// 正常时钟 + 服务重开：重叠预约在重开后仍按真实时间继续推进，
+// 到期恢复目标依旧需要设备确认。
+func TestReservationRealClockRestartContinuesOverlapping(t *testing.T) {
+	c, _, dbPath := newHarness(t)
+	now := time.Now().UTC()
+	wait := func(target time.Time) {
+		if d := time.Until(target.Add(60 * time.Millisecond)); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	start1 := now.Add(200 * time.Millisecond)
+	end1 := now.Add(900 * time.Millisecond)
+	start2 := now.Add(500 * time.Millisecond)
+	end2 := now.Add(1300 * time.Millisecond)
+	r1 := c.schedule(map[string]twin.Config{"dev-1": {"temp": "18"}}, start1, end1)
+	r2 := c.schedule(map[string]twin.Config{"dev-1": {"temp": "16"}}, start2, end2)
+
+	wait(start1)
+	c2 := newHarnessFromPath(t, dbPath) // 第一次重开
+	r1 = c2.change(r1.ID)
+	rev1 := r1.DeviceResults["dev-1"].DesiredRev
+	if rev1 == 0 {
+		t.Fatal("重开后正常时钟跨过开始时刻应激活 r1")
+	}
+	c2.pull("dev-1")
+	c2.report("dev-1", twin.ReportRequest{Rev: rev1, Applied: twin.Config{"temp": "18"}})
+	if got := c2.change(r1.ID).DeviceResults["dev-1"].Status; got != twin.StatusEffective {
+		t.Fatalf("重开后设备确认 r1 才 EFFECTIVE，得到 %s", got)
+	}
+
+	wait(start2)
+	c3 := newHarnessFromPath(t, dbPath) // 第二次重开
+	if got := c3.change(r1.ID).DeviceResults["dev-1"].DispatchState; got != "OVERLAPPED" {
+		t.Fatalf("重开后 r1 被重叠预约覆盖应为 OVERLAPPED，得到 %s", got)
+	}
+	r2 = c3.change(r2.ID)
+	rev2 := r2.DeviceResults["dev-1"].DesiredRev
+	if rev2 == 0 {
+		t.Fatal("重开后 r2 到点应生成待拉取目标")
+	}
+	c3.pull("dev-1")
+	c3.report("dev-1", twin.ReportRequest{Rev: rev2, Applied: twin.Config{"temp": "16"}})
+
+	wait(end1)
+	r1 = c3.change(r1.ID)
+	if got := r1.Status; got != twin.StatusExpired {
+		t.Fatalf("重开后 r1 到期应 EXPIRED，得到 %s", got)
+	}
+	if r1.RestoresToChange != r2.ID {
+		t.Fatalf("r1 到期应指向当时仍有效的 r2，得到 %q", r1.RestoresToChange)
+	}
+
+	wait(end2)
+	c4 := newHarnessFromPath(t, dbPath) // 第三次重开
+	r2 = c4.change(r2.ID)
+	if got := r2.Status; got != twin.StatusExpired {
+		t.Fatalf("重开后 r2 到期应 EXPIRED，得到 %s", got)
+	}
+	restore := c4.restoreFor(r2, "dev-1")
+	if st := restore.DeviceResults["dev-1"].Status; st != twin.StatusPending && st != twin.StatusDelivered {
+		t.Fatalf("重开后恢复目标仍须设备确认，得到 %s", st)
+	}
+	c4.pull("dev-1")
+	c4.report("dev-1", twin.ReportRequest{Rev: restore.DeviceResults["dev-1"].DesiredRev, Applied: twin.Config{}})
+	if v := c4.twin("dev-1"); v.Status != twin.StatusEffective || len(v.DesiredConfig) != 0 {
+		t.Fatalf("重开后恢复目标经设备确认后才算完成，得到 %+v", v)
 	}
 }

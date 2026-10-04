@@ -309,12 +309,18 @@ func allDeviceResults(ch *Change, want Status) bool {
 }
 
 func (s *Store) processDueLocked(now time.Time) error {
-	if s.clock == nil || now.Before(*s.clock) {
-		return nil
+	// 正常时钟与虚拟时钟走同一套到期处理：有效时间取两者较大值；
+	// 只有启用了虚拟时钟时才推进持久化时钟。
+	effective := now
+	if s.clock != nil {
+		if now.Before(*s.clock) {
+			effective = *s.clock
+		} else {
+			s.clock = timePtrUTC(now)
+		}
 	}
-	s.clock = timePtrUTC(now)
 	for {
-		changed, err := s.runDueOnceLocked(now)
+		changed, err := s.runDueOnceLocked(effective)
 		if err != nil {
 			return err
 		}

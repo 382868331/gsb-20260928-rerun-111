@@ -39,7 +39,8 @@
 - **带有效期预约**：`POST /changes` 可带 `start_at`/`end_at`。未到 `start_at` 是 `SCHEDULED`，时间到了只生成待设备拉取的目标；只有设备精确回报后才是 `EFFECTIVE`。`end_at` 到期不等于设备已恢复，系统会生成 `RESTORATION` 恢复目标并继续等待确认。
 - **重叠预约恢复**：多个预约可重叠。新预约生效时只覆盖仍在有效期内的旧预约，不把旧预约永久标记为普通取代；旧预约到期时动态选择当时仍有效的预约目标，没有有效预约时才使用创建预约时记录的已确认基线。
 - **执行中调整**：`POST /changes/{id}/shorten` 可按设备缩短有效期，`POST /changes/{id}/cancel` 可取消尚未开始的预约或取消剩余设备；已经确认发生的效果保留在历史中，并自动安排必要恢复收尾。
-- **虚拟时间与等待原因**：`POST /clock`（也兼容 `/clock/advance`、`/time/advance`、`/virtual-time/advance`）推进持久化虚拟时钟。设备离线导致恢复目标停留在 `PENDING`/`DELIVERED` 时，逐设备结果通过 `wait_reason` 说明在等待哪次预约的生效或恢复核实。
+ - **虚拟时间与等待原因**：`POST /clock`（也兼容 `/clock/advance`、`/time/advance`、`/virtual-time/advance`）推进持久化虚拟时钟。设备离线导致恢复目标停留在 `PENDING`/`DELIVERED` 时，逐设备结果通过 `wait_reason` 说明在等待哪次预约的生效或恢复核实。
+ - **正常/虚拟时钟一致**：未设置虚拟时钟时，预约的开始与到期同样随真实请求时间推进；两种时钟走同一套到期处理规则，服务重开后也会继续推进重叠预约，恢复目标仍需设备确认。
 
 ## HTTP 接口
 
