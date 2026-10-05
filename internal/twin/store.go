@@ -19,15 +19,26 @@ type Store struct {
 	changes     map[string]*Change
 	changeSeq   int64
 	clock       *time.Time
+	// 站点级功率调度状态。
+	reservations   map[string]*PowerReservation
+	reservationSeq int64
+	powerLimitKW   float64
+	powerLimitSet  bool
+	powerOverloads []PowerOverloadView
 }
 
 type snapshot struct {
-	Devices     []*Device   `json:"devices"`
-	Conflicts   []*Conflict `json:"conflicts"`
-	ConflictSeq int64       `json:"conflict_seq"`
-	Changes     []*Change   `json:"changes"`
-	ChangeSeq   int64       `json:"change_seq"`
-	Clock       *time.Time  `json:"clock,omitempty"`
+	Devices        []*Device           `json:"devices"`
+	Conflicts      []*Conflict         `json:"conflicts"`
+	ConflictSeq    int64               `json:"conflict_seq"`
+	Changes        []*Change           `json:"changes"`
+	ChangeSeq      int64               `json:"change_seq"`
+	Clock          *time.Time          `json:"clock,omitempty"`
+	Reservations   []*PowerReservation `json:"reservations,omitempty"`
+	ReservationSeq int64               `json:"reservation_seq,omitempty"`
+	PowerLimitKW   float64             `json:"power_limit_kw,omitempty"`
+	PowerLimitSet  bool                `json:"power_limit_set,omitempty"`
+	PowerOverloads []PowerOverloadView `json:"power_overloads,omitempty"`
 }
 
 type PublishOptions struct {
@@ -40,10 +51,11 @@ type PublishOptions struct {
 
 func NewStore(path string) (*Store, error) {
 	s := &Store{
-		path:      path,
-		devices:   map[string]*Device{},
-		conflicts: map[string]*Conflict{},
-		changes:   map[string]*Change{},
+		path:         path,
+		devices:      map[string]*Device{},
+		conflicts:    map[string]*Conflict{},
+		changes:      map[string]*Change{},
+		reservations: map[string]*PowerReservation{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -75,6 +87,13 @@ func (s *Store) load() error {
 	}
 	s.changeSeq = snap.ChangeSeq
 	s.clock = snap.Clock
+	for _, r := range snap.Reservations {
+		s.reservations[r.ID] = r
+	}
+	s.reservationSeq = snap.ReservationSeq
+	s.powerLimitKW = snap.PowerLimitKW
+	s.powerLimitSet = snap.PowerLimitSet
+	s.powerOverloads = snap.PowerOverloads
 	return nil
 }
 
@@ -92,6 +111,14 @@ func (s *Store) persistLocked() error {
 	snap.ConflictSeq = s.conflictSeq
 	snap.ChangeSeq = s.changeSeq
 	snap.Clock = s.clock
+	snap.ReservationSeq = s.reservationSeq
+	snap.PowerLimitKW = s.powerLimitKW
+	snap.PowerLimitSet = s.powerLimitSet
+	snap.PowerOverloads = s.powerOverloads
+	for _, r := range s.reservations {
+		snap.Reservations = append(snap.Reservations, r)
+	}
+	sort.Slice(snap.Reservations, func(i, j int) bool { return snap.Reservations[i].ID < snap.Reservations[j].ID })
 	for _, ch := range s.changes {
 		snap.Changes = append(snap.Changes, ch)
 	}
@@ -325,9 +352,25 @@ func (s *Store) processDueLocked(now time.Time) error {
 			return err
 		}
 		if !changed {
-			return nil
+			break
 		}
 	}
+	// 功率预约与正常/虚拟时钟走同一套规则：到点即进入下发与确认流程；
+	// 容量不足（如停止目标未确认）时先重排，绝不提前超额启动。
+	s.syncPowerStatesLocked(effective)
+	blocked, err := s.dispatchDuePowerLocked(effective)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		if err := s.replanPowerLocked(effective); err != nil {
+			return err
+		}
+		if _, err := s.dispatchDuePowerLocked(effective); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func timePtrUTC(t time.Time) *time.Time {
@@ -437,6 +480,8 @@ func (s *Store) finishReservationDeviceLocked(reservation *Change, deviceID stri
 	if result.Status == StatusEffective {
 		if reason == "CANCELLED" {
 			result.DispatchState = "CANCELLED_EFFECTIVE"
+		} else if reason == "INTERRUPTED" {
+			result.DispatchState = "INTERRUPTED_EFFECTIVE"
 		} else {
 			result.DispatchState = "EXPIRED_EFFECTIVE"
 		}
@@ -444,6 +489,9 @@ func (s *Store) finishReservationDeviceLocked(reservation *Change, deviceID stri
 		if reason == "CANCELLED" {
 			result.Status = StatusCancelled
 			result.DispatchState = "CANCELLED"
+		} else if reason == "INTERRUPTED" {
+			result.Status = StatusExpired
+			result.DispatchState = "INTERRUPTED"
 		} else {
 			result.Status = StatusExpired
 			result.DispatchState = "EXPIRED"
@@ -506,12 +554,17 @@ func (s *Store) createRestorationLocked(deviceID string, target Config, targetCh
 	if result.Status == StatusEffective {
 		if result.EndReason == "CANCELLED" {
 			result.DispatchState = "CANCELLED_EFFECTIVE"
+		} else if result.EndReason == "INTERRUPTED" {
+			result.DispatchState = "INTERRUPTED_EFFECTIVE"
 		} else {
 			result.DispatchState = "EXPIRED_EFFECTIVE"
 		}
 	} else if result.EndReason == "CANCELLED" {
 		result.Status = StatusCancelled
 		result.DispatchState = "CANCELLED"
+	} else if result.EndReason == "INTERRUPTED" {
+		result.Status = StatusExpired
+		result.DispatchState = "INTERRUPTED"
 	} else {
 		result.Status = StatusExpired
 		result.DispatchState = "EXPIRED"
@@ -660,6 +713,18 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 	if err := s.processDueLocked(now); err != nil {
 		return nil, err
 	}
+	ch, err := s.publishChangeLocked(targets, opts, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return cloneChange(ch), nil
+}
+
+// publishChangeLocked 是持锁状态下的发布实现，供功率调度等到点下发复用。
+func (s *Store) publishChangeLocked(targets map[string]Config, opts PublishOptions, now time.Time) (*Change, error) {
 	var startAt, endAt *time.Time
 	if opts.StartAt != nil {
 		t := opts.StartAt.UTC()
@@ -780,7 +845,10 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 			c.Open = false
 			c.ResolvedAt = &now
 		}
-		s.assignTargetToDeviceLocked(ch, id, targets[id], d, now, nil, nil)
+		s.assignTargetToDeviceLocked(ch, id, targets[id], d, now, nil, endAt)
+		if endAt != nil {
+			ch.DeviceEndsAt[id] = *endAt
+		}
 		if previousID != "" && previousID != ch.ID {
 			if previous := s.changes[previousID]; previous != nil {
 				s.supersedeDeviceInChangeLocked(previous, id, now)
@@ -792,10 +860,7 @@ func (s *Store) PublishChangeWithOptions(targets map[string]Config, opts Publish
 	sort.Strings(ch.Supersedes)
 	s.refreshChangeStatusLocked(ch, now)
 	s.changes[ch.ID] = ch
-	if err := s.persistLocked(); err != nil {
-		return nil, err
-	}
-	return cloneChange(ch), nil
+	return ch, nil
 }
 
 // PublishCompensation 以各设备上一份精确确认状态作为默认补偿目标；也可显式给出补偿配置。
@@ -947,6 +1012,13 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 		s.activateNextQueuedForDeviceLocked(deviceID, now)
 	}
 
+	// 停止确认可能刚释放了站点容量：只重排尚未开始的任务并下发到点计划。
+	if err := s.replanPowerLocked(now); err != nil {
+		return nil, nil, false, err
+	}
+	if _, err := s.dispatchDuePowerLocked(now); err != nil {
+		return nil, nil, false, err
+	}
 	if err := s.persistLocked(); err != nil {
 		return nil, nil, false, err
 	}
@@ -966,8 +1038,13 @@ func (s *Store) resolveOpenLocked(deviceID string, reason ConflictReason, rev in
 func (s *Store) MarkOffline(deviceID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := s.nowLocked()
 	d := s.deviceLocked(deviceID)
 	d.Online = false
+	// 设备离线只触发对尚未开始任务的重排，已启动任务保持原样。
+	if err := s.replanPowerLocked(now); err != nil {
+		return err
+	}
 	return s.persistLocked()
 }
 

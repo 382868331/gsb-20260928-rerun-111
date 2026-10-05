@@ -42,6 +42,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /devices/{id}/offline", s.offline)
 	mux.HandleFunc("GET /devices/{id}/twin", s.getTwin)
 	mux.HandleFunc("GET /devices/{id}/conflicts", s.listConflicts)
+	mux.HandleFunc("POST /power/reservations", s.createPowerReservation)
+	mux.HandleFunc("GET /power/reservations", s.listPowerReservations)
+	mux.HandleFunc("GET /power/reservations/{id}", s.getPowerReservation)
+	mux.HandleFunc("POST /power/reservations/{id}/cancel", s.cancelPowerReservation)
+	mux.HandleFunc("GET /power/plan", s.getPowerPlan)
+	mux.HandleFunc("PUT /site/power-limit", s.setPowerLimit)
 	return mux
 }
 
@@ -293,6 +299,64 @@ func (s *Server) listConflicts(w http.ResponseWriter, r *http.Request) {
 	includeResolved, _ := strconv.ParseBool(r.URL.Query().Get("resolved"))
 	list := s.store.Conflicts(id, includeResolved || strings.EqualFold(r.URL.Query().Get("all"), "true"))
 	writeJSON(w, http.StatusOK, map[string]any{"device_id": id, "conflicts": list})
+}
+
+func (s *Server) createPowerReservation(w http.ResponseWriter, r *http.Request) {
+	req := twin.PowerReservationRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "功率预约请求必须是 JSON 对象: "+err.Error())
+		return
+	}
+	res, err := s.store.CreatePowerReservation(req, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, res)
+}
+
+func (s *Server) listPowerReservations(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.store.PowerPlan(s.now()))
+}
+
+func (s *Server) getPowerReservation(w http.ResponseWriter, r *http.Request) {
+	res, ok := s.store.PowerReservation(r.PathValue("id"), s.now())
+	if !ok {
+		writeErr(w, http.StatusNotFound, "功率预约不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) cancelPowerReservation(w http.ResponseWriter, r *http.Request) {
+	res, err := s.store.CancelPowerReservation(r.PathValue("id"), s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) getPowerPlan(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.store.PowerPlan(s.now()))
+}
+
+type powerLimitRequest struct {
+	PowerLimitKW float64 `json:"power_limit_kw"`
+}
+
+func (s *Server) setPowerLimit(w http.ResponseWriter, r *http.Request) {
+	req := powerLimitRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求必须是 {power_limit_kw:数值} JSON: "+err.Error())
+		return
+	}
+	plan, err := s.store.SetPowerLimit(req.PowerLimitKW, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
 }
 
 func statusText(st twin.Status) string {
