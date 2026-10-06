@@ -40,7 +40,10 @@
 - **重叠预约恢复**：多个预约可重叠。新预约生效时只覆盖仍在有效期内的旧预约，不把旧预约永久标记为普通取代；旧预约到期时动态选择当时仍有效的预约目标，没有有效预约时才使用创建预约时记录的已确认基线。
 - **执行中调整**：`POST /changes/{id}/shorten` 可按设备缩短有效期，`POST /changes/{id}/cancel` 可取消尚未开始的预约或取消剩余设备；已经确认发生的效果保留在历史中，并自动安排必要恢复收尾。
  - **虚拟时间与等待原因**：`POST /clock`（也兼容 `/clock/advance`、`/time/advance`、`/virtual-time/advance`）推进持久化虚拟时钟。设备离线导致恢复目标停留在 `PENDING`/`DELIVERED` 时，逐设备结果通过 `wait_reason` 说明在等待哪次预约的生效或恢复核实。
- - **正常/虚拟时钟一致**：未设置虚拟时钟时，预约的开始与到期同样随真实请求时间推进；两种时钟走同一套到期处理规则，服务重开后也会继续推进重叠预约，恢复目标仍需设备确认。
+- **正常/虚拟时钟一致**：未设置虚拟时钟时，预约的开始与到期同样随真实请求时间推进；两种时钟走同一套到期处理规则，服务重开后也会继续推进重叠预约，恢复目标仍需设备确认。
+- **站点级功率约束调度**：`POST /power/reservations` 提交的每项预约声明允许开始窗口（earliest_start/latest_start）、必须连续运行的时长 duration_sec、运行功率 power 与 priority。求解器（回溯搜索，internal/power）选择实际开始时间，使任一时刻站点总功率不超过 `PUT /site/power-limit` 设置的上限；目标先按优先级尽量满足更多预约，再减少启动偏移。无法同时满足时，响应中的 conflict 给出实际冲突预约与超限区间，绝不悄悄缩短任务。
+- **功率计划走既有下发/确认流程**：到点的预约被转换成带 start_at/end_at 的预约变更，仍需设备拉取、上报、确认。只发出停止目标而尚未得到设备确认时，原设备功率仍计入站点负载，容量不会提前分给新任务（受影响的预约保持 HELD，不受影响的照常执行）。
+- **重排与中断许可**：临时降低站点上限、设备离线、紧急预约（emergency:true）加入都会触发重排，但只重新安排尚未实际开始的普通任务；已经开始的连续运行任务保持不动，只有声明 allow_interrupt 的任务会按许可被中断（记录 INTERRUPTED），无许可任务造成的超限通过 site_overloads 如实报告。正常时钟与虚拟时钟使用同一套规则。
 
 ## HTTP 接口
 
@@ -55,6 +58,9 @@
 | `POST /changes/{id}/shorten` | 缩短一个或多个设备的预约结束时间，body：`{"end_at":...,"devices":[...]}` |
 | `POST /changes/{id}/cancel` | 取消预约或取消指定设备的剩余有效期，body：`{"devices":[...]}` |
 | `GET /clock` / `POST /clock` | 查询或推进持久化虚拟时间，body：`{"now":"RFC3339"}` |
+| `PUT /site/power-limit` | 设置/临时降低站点功率上限，body：`{"limit":10}`；触发重排并返回最新计划 |
+| `GET /site/power` | 站点功率视图：上限、当前已承诺负载、逐项预约状态与超限区间 |
+| `POST /power/reservations` | 提交功率预约并求解，body：`{"reservations":[{"device_id","config","earliest_start","latest_start","duration_sec","power","priority","allow_interrupt","emergency"}]}` |
 | `GET /devices/{id}/twin` | 单设备三态视图与中文状态 |
 | `PUT /devices/{id}/desired` | 下发整份期望配置（JSON 对象），返回新版本号 |
 | `POST /devices/{id}/pull` | 设备拉取期望；有新版本时返回 `changed=true`，只标记已下发 |

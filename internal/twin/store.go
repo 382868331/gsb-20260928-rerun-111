@@ -11,23 +11,29 @@ import (
 )
 
 type Store struct {
-	mu          sync.Mutex
-	path        string
-	devices     map[string]*Device
-	conflicts   map[string]*Conflict
-	conflictSeq int64
-	changes     map[string]*Change
-	changeSeq   int64
-	clock       *time.Time
+	mu             sync.Mutex
+	path           string
+	devices        map[string]*Device
+	conflicts      map[string]*Conflict
+	conflictSeq    int64
+	changes        map[string]*Change
+	changeSeq      int64
+	clock          *time.Time
+	sitePowerLimit *float64
+	powerRes       map[string]*PowerReservation
+	powerSeq       int64
 }
 
 type snapshot struct {
-	Devices     []*Device   `json:"devices"`
-	Conflicts   []*Conflict `json:"conflicts"`
-	ConflictSeq int64       `json:"conflict_seq"`
-	Changes     []*Change   `json:"changes"`
-	ChangeSeq   int64       `json:"change_seq"`
-	Clock       *time.Time  `json:"clock,omitempty"`
+	Devices        []*Device           `json:"devices"`
+	Conflicts      []*Conflict         `json:"conflicts"`
+	ConflictSeq    int64               `json:"conflict_seq"`
+	Changes        []*Change           `json:"changes"`
+	ChangeSeq      int64               `json:"change_seq"`
+	Clock          *time.Time          `json:"clock,omitempty"`
+	SitePowerLimit *float64            `json:"site_power_limit,omitempty"`
+	PowerRes       []*PowerReservation `json:"power_reservations,omitempty"`
+	PowerSeq       int64               `json:"power_seq,omitempty"`
 }
 
 type PublishOptions struct {
@@ -44,6 +50,7 @@ func NewStore(path string) (*Store, error) {
 		devices:   map[string]*Device{},
 		conflicts: map[string]*Conflict{},
 		changes:   map[string]*Change{},
+		powerRes:  map[string]*PowerReservation{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -75,6 +82,11 @@ func (s *Store) load() error {
 	}
 	s.changeSeq = snap.ChangeSeq
 	s.clock = snap.Clock
+	s.sitePowerLimit = snap.SitePowerLimit
+	for _, r := range snap.PowerRes {
+		s.powerRes[r.ID] = r
+	}
+	s.powerSeq = snap.PowerSeq
 	return nil
 }
 
@@ -92,10 +104,16 @@ func (s *Store) persistLocked() error {
 	snap.ConflictSeq = s.conflictSeq
 	snap.ChangeSeq = s.changeSeq
 	snap.Clock = s.clock
+	snap.SitePowerLimit = s.sitePowerLimit
+	snap.PowerSeq = s.powerSeq
 	for _, ch := range s.changes {
 		snap.Changes = append(snap.Changes, ch)
 	}
 	sort.Slice(snap.Changes, func(i, j int) bool { return snap.Changes[i].ID < snap.Changes[j].ID })
+	for _, r := range s.powerRes {
+		snap.PowerRes = append(snap.PowerRes, r)
+	}
+	sort.Slice(snap.PowerRes, func(i, j int) bool { return snap.PowerRes[i].ID < snap.PowerRes[j].ID })
 
 	data, err := json.MarshalIndent(&snap, "", "  ")
 	if err != nil {
@@ -318,6 +336,23 @@ func (s *Store) processDueLocked(now time.Time) error {
 		} else {
 			s.clock = timePtrUTC(now)
 		}
+	}
+	for {
+		changed, err := s.runDueOnceLocked(effective)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			break
+		}
+	}
+	// 功率预约：先按确认结果推进状态（停止确认后容量才真正释放），
+	// 有容量释放时重排未开始的预约，再派发到点且容量足够的预约。
+	if s.sweepPowerReservationsLocked(effective) {
+		s.replanPowerLocked(effective)
+	}
+	if err := s.dispatchDuePowerLocked(effective); err != nil {
+		return err
 	}
 	for {
 		changed, err := s.runDueOnceLocked(effective)
@@ -947,6 +982,15 @@ func (s *Store) Report(deviceID string, req ReportRequest, now time.Time) (*Devi
 		s.activateNextQueuedForDeviceLocked(deviceID, now)
 	}
 
+	// 上报可能确认了某个停止/恢复目标：容量此刻才真正释放，
+	// 推进功率预约状态并重排、派发等待容量的预约。
+	if s.sweepPowerReservationsLocked(now) {
+		s.replanPowerLocked(now)
+	}
+	if err := s.dispatchDuePowerLocked(now); err != nil {
+		return nil, nil, false, err
+	}
+
 	if err := s.persistLocked(); err != nil {
 		return nil, nil, false, err
 	}
@@ -968,6 +1012,8 @@ func (s *Store) MarkOffline(deviceID string) error {
 	defer s.mu.Unlock()
 	d := s.deviceLocked(deviceID)
 	d.Online = false
+	// 设备离线触发重排：只能重新安排尚未实际开始的普通任务。
+	s.replanPowerLocked(s.nowLocked())
 	return s.persistLocked()
 }
 

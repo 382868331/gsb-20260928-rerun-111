@@ -33,6 +33,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /changes/{id}/shorten", s.shortenChange)
 	mux.HandleFunc("POST /clock", s.setClock)
 	mux.HandleFunc("GET /clock", s.getClock)
+	mux.HandleFunc("PUT /site/power-limit", s.setPowerLimit)
+	mux.HandleFunc("GET /site/power", s.getPowerOverview)
+	mux.HandleFunc("POST /power/reservations", s.submitPowerReservations)
 	mux.HandleFunc("POST /clock/advance", s.setClock)
 	mux.HandleFunc("POST /virtual-time/advance", s.setClock)
 	mux.HandleFunc("POST /time/advance", s.setClock)
@@ -191,6 +194,50 @@ func (s *Server) setClock(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getClock(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"now": s.store.Now()})
+}
+
+type powerLimitRequest struct {
+	Limit float64 `json:"limit"`
+}
+
+func (s *Server) setPowerLimit(w http.ResponseWriter, r *http.Request) {
+	req := powerLimitRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求必须是 {\"limit\":数字} JSON: "+err.Error())
+		return
+	}
+	overview, err := s.store.SetSitePowerLimit(req.Limit, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, overview)
+}
+
+func (s *Server) getPowerOverview(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.store.PowerOverview(s.now()))
+}
+
+type powerReservationsRequest struct {
+	Reservations []twin.PowerReservationRequest `json:"reservations"`
+}
+
+func (s *Server) submitPowerReservations(w http.ResponseWriter, r *http.Request) {
+	req := powerReservationsRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求必须是 {\"reservations\":[...]} JSON: "+err.Error())
+		return
+	}
+	if len(req.Reservations) == 0 {
+		writeErr(w, http.StatusBadRequest, "预约列表不能为空")
+		return
+	}
+	overview, err := s.store.SubmitPowerReservations(req.Reservations, s.now())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, overview)
 }
 
 func (s *Server) getChange(w http.ResponseWriter, r *http.Request) {
